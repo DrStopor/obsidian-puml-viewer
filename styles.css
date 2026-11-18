@@ -1,3 +1,14 @@
+.dropdown.puml-render-mode-dropdown {
+  min-inline-size: calc(var(--dropdown-fitted-width, 0px) + 0.6em);
+  padding-inline-end: 3em;
+}
+
+.puml-jar-settings {
+  margin-block: var(--size-4-2, 8px);
+  padding-inline-start: var(--size-4-3, 12px);
+  border-inline-start: 2px solid var(--background-modifier-border);
+}
+
 .puml-viewer-container {
   display: flex;
   flex-direction: column;

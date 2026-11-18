@@ -1,11 +1,15 @@
 import {
   App,
+  FileSystemAdapter,
   ItemView,
+  type MarkdownPostProcessorContext,
+  MarkdownRenderChild,
   MarkdownView,
   Menu,
   Modal,
   Notice,
   normalizePath,
+  Platform,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -15,6 +19,14 @@ import {
   requestUrl,
 } from 'obsidian';
 import { encode } from 'plantuml-encoder';
+import {
+  checkRenderSignal,
+  DEFAULT_PLANTUML_LIMIT_SIZE,
+  type DiagramFormat,
+  PlantUmlJarError,
+  PlantUmlJarRenderer,
+} from './plantuml-jar';
+import { addJarSettings, type JarSettings } from './jar-settings';
 
 const VIEW_TYPE_PUML = 'puml-viewer';
 const encodePlantuml = encode;
@@ -28,12 +40,17 @@ const SUPPORTED_DIAGRAM_EXTENSIONS = [
 ] as const;
 
 type ViewMode = 'view' | 'edit';
-type DiagramFormat = 'svg' | 'png' | 'txt';
 type DiagramType = 'plantuml' | 'mermaid';
 type ExportConflictAction = 'overwrite' | 'new-file' | 'cancel';
+type RenderMode = 'plantuml' | 'kroki' | 'local' | 'jar';
 
-interface PUMLViewerSettings {
-  serverType: 'plantuml' | 'kroki' | 'local';
+interface RenderContext {
+  sourcePath?: string;
+  signal?: AbortSignal;
+}
+
+interface PUMLViewerSettings extends JarSettings {
+  serverType: RenderMode;
   plantumlServerUrl: string;
   krokiServerUrl: string;
   krokiDiagramType: DiagramType;
@@ -51,6 +68,9 @@ const DEFAULT_SETTINGS: PUMLViewerSettings = {
   krokiServerUrl: 'https://kroki.io',
   krokiDiagramType: 'plantuml',
   localServerUrl: 'http://localhost:8000',
+  javaExecutable: 'java',
+  plantumlJarPath: '',
+  plantumlLimitSize: DEFAULT_PLANTUML_LIMIT_SIZE,
   imageFormat: 'svg',
   autoRefresh: true,
   lastOpenedPumlPath: '',
@@ -135,8 +155,31 @@ function parseSvgMarkup(svgMarkup: string): SVGSVGElement | null {
   return normalized;
 }
 
+function isRenderCancelled(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+function setDiagramImageUrl(img: HTMLImageElement, objectUrl: string, signal: AbortSignal): void {
+  const release = () => {
+    URL.revokeObjectURL(objectUrl);
+    signal.removeEventListener('abort', release);
+    img.removeEventListener('load', release);
+    img.removeEventListener('error', release);
+  };
+  if (signal.aborted) {
+    release();
+    checkRenderSignal(signal);
+  }
+  signal.addEventListener('abort', release, { once: true });
+  img.addEventListener('load', release, { once: true });
+  img.addEventListener('error', release, { once: true });
+  img.src = objectUrl;
+}
+
 export default class PUMLViewerPlugin extends Plugin {
   settings!: PUMLViewerSettings;
+  private jarRenderer?: PlantUmlJarRenderer;
+  private readonly renderLifetime = new AbortController();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -176,7 +219,7 @@ export default class PUMLViewerPlugin extends Plugin {
           source,
           lang,
         );
-        await this.renderEmbeddedDiagramBlock(source, el, fenceWidthHintPx, lang);
+        await this.renderEmbeddedDiagramBlock(source, el, fenceWidthHintPx, lang, ctx);
       });
     }
 
@@ -184,6 +227,8 @@ export default class PUMLViewerPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.renderLifetime.abort();
+    this.jarRenderer?.dispose();
     this.app.workspace.getLeavesOfType(VIEW_TYPE_PUML).forEach((leaf) => leaf.detach());
   }
 
@@ -196,7 +241,7 @@ export default class PUMLViewerPlugin extends Plugin {
         loaded.krokiServerUrl = loaded.serverUrl;
       } else if (loaded.serverType === 'local') {
         loaded.localServerUrl = loaded.serverUrl;
-      } else {
+      } else if (loaded.serverType !== 'jar') {
         loaded.plantumlServerUrl = loaded.serverUrl;
       }
     }
@@ -205,6 +250,12 @@ export default class PUMLViewerPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  async setRenderMode(mode: RenderMode): Promise<void> {
+    if (mode !== this.settings.serverType) this.jarRenderer?.cancelAll();
+    this.settings.serverType = mode;
+    await this.saveSettings();
   }
 
   rerenderMarkdownPreviews(): void {
@@ -234,6 +285,9 @@ export default class PUMLViewerPlugin extends Plugin {
   }
 
   buildRenderUrl(source: string, diagramType?: DiagramType): string {
+    if (this.settings.serverType === 'jar') {
+      throw new PlantUmlJarError('PlantUML JAR rendering does not use a server URL.');
+    }
     const useKroki = this.settings.serverType === 'kroki' || diagramType === 'mermaid';
     const normalizedBase = useKroki
       ? this.settings.krokiServerUrl.replace(/\/+$/, '').replace(/\/plantuml$/i, '')
@@ -272,7 +326,37 @@ export default class PUMLViewerPlugin extends Plugin {
     return headers['content-type'] ?? headers['Content-Type'] ?? '';
   }
 
-  async requestDiagram(source: string, format: DiagramFormat, diagramType?: DiagramType) {
+  async requestDiagram(source: string, format: DiagramFormat, diagramType?: DiagramType, context?: RenderContext) {
+    checkRenderSignal(this.renderLifetime.signal);
+    checkRenderSignal(context?.signal);
+    if (this.settings.serverType === 'jar') {
+      if (!Platform.isDesktopApp) {
+        throw new PlantUmlJarError('PlantUML JAR is available in desktop Obsidian. Choose an HTTP render mode on mobile.');
+      }
+      if (diagramType === 'mermaid') {
+        throw new PlantUmlJarError('PlantUML JAR renders PlantUML diagrams. Choose an HTTP render mode for Mermaid.');
+      }
+      const adapter = this.app.vault.adapter;
+      if (!(adapter instanceof FileSystemAdapter)) {
+        throw new PlantUmlJarError('PlantUML JAR requires a local vault folder.');
+      }
+      this.jarRenderer ??= new PlantUmlJarRenderer();
+      const result = await this.jarRenderer.render(source, format, {
+        javaExecutable: this.settings.javaExecutable,
+        jarPath: this.settings.plantumlJarPath,
+        limitSize: this.settings.plantumlLimitSize,
+        vaultPath: adapter.getBasePath(),
+        sourcePath: context?.sourcePath,
+        isWindows: Platform.isWin,
+      }, context?.signal);
+      return {
+        status: 200,
+        headers: { 'content-type': result.contentType },
+        text: result.text,
+        arrayBuffer: result.arrayBuffer,
+      };
+    }
+
     const useKroki = this.settings.serverType === 'kroki' || diagramType === 'mermaid';
     if (useKroki) {
       const normalizedBase = this.settings.krokiServerUrl
@@ -302,15 +386,36 @@ export default class PUMLViewerPlugin extends Plugin {
     });
   }
 
-  async fetchPngObjectUrl(source: string, diagramType?: DiagramType): Promise<string> {
-    const response = await this.requestDiagram(source, 'png', diagramType);
+  async fetchSvgElement(source: string, diagramType?: DiagramType, context?: RenderContext): Promise<SVGSVGElement> {
+    const response = await this.requestDiagram(source, 'svg', diagramType, context);
+    checkRenderSignal(context?.signal);
+    if (response.status !== 200) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const contentType = this.responseContentType(response);
+    if (contentType && !contentType.includes('image/svg')) {
+      throw new Error(
+        `Expected SVG but got "${contentType}". Check the render mode and server URL (for Kroki use https://kroki.io).`,
+      );
+    }
+    if (!response.text.includes('<svg')) {
+      throw new Error('Response is not SVG content.');
+    }
+    const svg = parseSvgMarkup(response.text);
+    if (!svg) throw new Error('Response is not valid SVG content.');
+    return svg;
+  }
+
+  async fetchPngObjectUrl(source: string, diagramType?: DiagramType, context?: RenderContext): Promise<string> {
+    const response = await this.requestDiagram(source, 'png', diagramType, context);
+    checkRenderSignal(context?.signal);
     if (response.status !== 200) {
       throw new Error(`HTTP ${response.status}`);
     }
     const contentType = this.responseContentType(response);
     if (contentType && !contentType.includes('image/png')) {
       throw new Error(
-        `Expected PNG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`,
+        `Expected PNG but got "${contentType}". Check the render mode and server URL (for Kroki use https://kroki.io).`,
       );
     }
     if (!response.arrayBuffer) {
@@ -326,8 +431,11 @@ export default class PUMLViewerPlugin extends Plugin {
     format: 'svg' | 'png',
     baseName = 'diagram',
     diagramType?: DiagramType,
+    context?: RenderContext,
+    doc = window.activeDocument,
   ): Promise<void> {
-    const response = await this.requestDiagram(source, format, diagramType);
+    const response = await this.requestDiagram(source, format, diagramType, context);
+    checkRenderSignal(context?.signal);
     if (response.status !== 200) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -337,7 +445,7 @@ export default class PUMLViewerPlugin extends Plugin {
       const contentType = this.responseContentType(response);
       if (contentType && !contentType.includes('image/svg')) {
         throw new Error(
-          `Expected SVG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`,
+          `Expected SVG but got "${contentType}". Check the render mode and server URL (for Kroki use https://kroki.io).`,
         );
       }
       if (!response.text.includes('<svg')) {
@@ -348,7 +456,7 @@ export default class PUMLViewerPlugin extends Plugin {
       const contentType = this.responseContentType(response);
       if (contentType && !contentType.includes('image/png')) {
         throw new Error(
-          `Expected PNG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`,
+          `Expected PNG but got "${contentType}". Check the render mode and server URL (for Kroki use https://kroki.io).`,
         );
       }
       if (!response.arrayBuffer) {
@@ -358,7 +466,7 @@ export default class PUMLViewerPlugin extends Plugin {
     }
 
     const objectUrl = URL.createObjectURL(blob);
-    const link = window.activeDocument.body.createEl('a');
+    const link = doc.body.createEl('a');
     link.href = objectUrl;
     link.download = `${baseName}.${format}`;
     link.click();
@@ -370,8 +478,9 @@ export default class PUMLViewerPlugin extends Plugin {
     source: string,
     baseName = 'diagram',
     diagramType?: DiagramType,
+    context?: RenderContext,
   ): Promise<void> {
-    await this.downloadDiagramAs(source, this.settings.imageFormat, baseName, diagramType);
+    await this.downloadDiagramAs(source, this.settings.imageFormat, baseName, diagramType, context);
   }
 
   private async renderEmbeddedDiagramBlock(
@@ -379,11 +488,23 @@ export default class PUMLViewerPlugin extends Plugin {
     el: HTMLElement,
     fenceWidthHintPx: number | null,
     diagramType: DiagramType,
+    ctx: MarkdownPostProcessorContext,
   ): Promise<void> {
+    if (this.renderLifetime.signal.aborted) return;
     const diagramLabel = diagramType === 'mermaid' ? 'Mermaid' : 'PlantUML';
     const { renderSource, widthHintPx } = this.extractEmbeddedWidthHint(source, fenceWidthHintPx);
 
     const container = el.createDiv({ cls: 'puml-embed-block' });
+    const child = new MarkdownRenderChild(container);
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    this.renderLifetime.signal.addEventListener('abort', abort, { once: true });
+    child.register(() => {
+      this.renderLifetime.signal.removeEventListener('abort', abort);
+      abort();
+    });
+    ctx.addChild(child);
+    const context = { sourcePath: ctx.sourcePath, signal: controller.signal };
     const actionsEl = container.createDiv({ cls: 'puml-embed-actions' });
     const toggleBtn = actionsEl.createEl('button', { cls: 'puml-embed-toggle' });
     const zoomBtn = actionsEl.createEl('button', { cls: 'puml-embed-zoom-btn', text: 'Zoom' });
@@ -448,7 +569,12 @@ export default class PUMLViewerPlugin extends Plugin {
     }
 
     const openZoomOverlay = async () => {
-      const overlayEl = window.activeDocument.body.createDiv({ cls: 'puml-zoom-overlay' });
+      if (context.signal.aborted) return;
+      const doc = container.ownerDocument;
+      const viewWindow = doc.defaultView ?? window;
+      const overlayEl = doc.body.createDiv({ cls: 'puml-zoom-overlay' });
+      const zoomController = new AbortController();
+      const zoomContext = { ...context, signal: zoomController.signal };
 
       const panelEl = overlayEl.createDiv({ cls: 'puml-zoom-panel' });
 
@@ -506,8 +632,8 @@ export default class PUMLViewerPlugin extends Plugin {
       const centerViewportOnce = () => {
         if (centeredInitially) return;
         centeredInitially = true;
-        window.activeWindow.requestAnimationFrame(() => {
-          centerViewport();
+        viewWindow.requestAnimationFrame(() => {
+          if (!zoomContext.signal.aborted) centerViewport();
         });
       };
 
@@ -551,14 +677,16 @@ export default class PUMLViewerPlugin extends Plugin {
         event.preventDefault();
       });
       contentEl.addEventListener('mouseleave', onPanMouseUp);
-      window.addEventListener('mousemove', onPanMouseMove);
-      window.addEventListener('mouseup', onPanMouseUp);
+      viewWindow.addEventListener('mousemove', onPanMouseMove);
+      viewWindow.addEventListener('mouseup', onPanMouseUp);
 
       const closeOverlay = () => {
-        window.activeDocument.removeEventListener('keydown', onKeyDown);
-        window.removeEventListener('resize', fitToViewport);
-        window.removeEventListener('mousemove', onPanMouseMove);
-        window.removeEventListener('mouseup', onPanMouseUp);
+        zoomController.abort();
+        context.signal.removeEventListener('abort', closeOverlay);
+        doc.removeEventListener('keydown', onKeyDown);
+        viewWindow.removeEventListener('resize', fitToViewport);
+        viewWindow.removeEventListener('mousemove', onPanMouseMove);
+        viewWindow.removeEventListener('mouseup', onPanMouseUp);
         overlayEl.remove();
       };
 
@@ -574,85 +702,74 @@ export default class PUMLViewerPlugin extends Plugin {
         }
       });
       closeBtn.addEventListener('click', closeOverlay);
-      window.activeDocument.addEventListener('keydown', onKeyDown);
-      window.addEventListener('resize', fitToViewport);
+      doc.addEventListener('keydown', onKeyDown);
+      viewWindow.addEventListener('resize', fitToViewport);
+      context.signal.addEventListener('abort', closeOverlay, { once: true });
 
       try {
         if (this.settings.imageFormat === 'svg') {
-          const response = await this.requestDiagram(renderSource, 'svg', diagramType);
-
-          if (response.status !== 200) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-          const contentType = this.responseContentType(response);
-          if (contentType && !contentType.includes('image/svg')) {
-            throw new Error(
-              `Expected SVG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`,
-            );
-          }
-          if (!response.text.includes('<svg')) {
-            throw new Error('Response is not SVG content.');
-          }
+          const svgEl = await this.fetchSvgElement(renderSource, diagramType, zoomContext);
+          checkRenderSignal(zoomContext.signal);
 
           loadingEl.remove();
           const svgHost = canvasEl.createDiv();
-          const svgEl = parseSvgMarkup(response.text);
-          if (svgEl) {
-            svgEl.addClass('puml-zoom-svg');
-            let baseSvgWidth = 0;
-            try {
-              const bbox = svgEl.getBBox();
-              if (bbox.width > 0 && bbox.height > 0) {
-                svgEl.setAttribute('viewBox', `${bbox.x} ${bbox.y} ${bbox.width} ${bbox.height}`);
-                baseSvgWidth = bbox.width;
-              }
-            } catch (error) {
-              console.debug('Failed to crop SVG by bbox', error);
+          svgEl.addClass('puml-zoom-svg');
+          let baseSvgWidth = 0;
+          try {
+            const bbox = svgEl.getBBox();
+            if (bbox.width > 0 && bbox.height > 0) {
+              svgEl.setAttribute('viewBox', `${bbox.x} ${bbox.y} ${bbox.width} ${bbox.height}`);
+              baseSvgWidth = bbox.width;
             }
-
-            renderedEl = svgEl;
-            const viewBoxWidth = baseSvgWidth || (svgEl.viewBox?.baseVal?.width ?? 0);
-            const widthAttr = Number.parseFloat(svgEl.getAttribute('width') ?? '0');
-            const measuredWidth = svgEl.getBoundingClientRect().width;
-            baseWidth = viewBoxWidth || widthAttr || measuredWidth || 1000;
-            fitToViewport();
-            centerViewportOnce();
-            svgHost.appendChild(svgEl);
-          } else {
-            throw new Error('Response is not valid SVG content.');
+          } catch (error) {
+            console.debug('Failed to crop SVG by bbox', error);
           }
+
+          renderedEl = svgEl;
+          const viewBoxWidth = baseSvgWidth || (svgEl.viewBox?.baseVal?.width ?? 0);
+          const widthAttr = Number.parseFloat(svgEl.getAttribute('width') ?? '0');
+          const measuredWidth = svgEl.getBoundingClientRect().width;
+          baseWidth = viewBoxWidth || widthAttr || measuredWidth || 1000;
+          fitToViewport();
+          centerViewportOnce();
+          svgHost.appendChild(svgEl);
           canvasEl.appendChild(svgHost);
         } else {
           const img = canvasEl.createEl('img', { cls: 'puml-zoom-image puml-is-hidden' });
           img.alt = `${diagramLabel} diagram`;
-          const objectUrl = await this.fetchPngObjectUrl(renderSource, diagramType);
-          img.src = objectUrl;
+          const objectUrl = await this.fetchPngObjectUrl(renderSource, diagramType, zoomContext);
 
           img.addEventListener(
             'load',
             () => {
+              if (zoomContext.signal.aborted) return;
               loadingEl.remove();
               renderedEl = img;
               baseWidth = img.naturalWidth || img.getBoundingClientRect().width || 1000;
               fitToViewport();
               img.removeClass('puml-is-hidden');
               centerViewportOnce();
-              URL.revokeObjectURL(objectUrl);
             },
             { once: true },
           );
           img.addEventListener(
             'error',
             () => {
+              if (zoomContext.signal.aborted) return;
               loadingEl.remove();
-              URL.revokeObjectURL(objectUrl);
               canvasEl.createDiv({ cls: 'puml-embed-error', text: 'Failed to load PNG diagram.' });
             },
             { once: true },
           );
+          setDiagramImageUrl(img, objectUrl, zoomContext.signal);
         }
       } catch (error) {
+        if (zoomContext.signal.aborted) return;
         loadingEl.remove();
+        if (isRenderCancelled(error)) {
+          canvasEl.createDiv({ text: 'Diagram generation cancelled.' });
+          return;
+        }
         canvasEl.createDiv({
           cls: 'puml-embed-error',
           text: `Failed to render diagram: ${error instanceof Error ? error.message : String(error)}`,
@@ -664,13 +781,16 @@ export default class PUMLViewerPlugin extends Plugin {
       void openZoomOverlay();
     });
     saveBtn.addEventListener('click', (event: MouseEvent) => {
+      if (context.signal.aborted) return;
       const menu = new Menu();
       menu.addItem((item) =>
         item.setTitle('Save as PNG').onClick(async () => {
           try {
-            await this.downloadDiagramAs(renderSource, 'png', `${diagramType}-diagram`, diagramType);
+            await this.downloadDiagramAs(renderSource, 'png', `${diagramType}-diagram`, diagramType, context, container.ownerDocument);
+            checkRenderSignal(context.signal);
             new Notice('Diagram saved as PNG');
           } catch (error) {
+            if (context.signal.aborted || isRenderCancelled(error)) return;
             new Notice(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
           }
         }),
@@ -678,9 +798,11 @@ export default class PUMLViewerPlugin extends Plugin {
       menu.addItem((item) =>
         item.setTitle('Save as SVG').onClick(async () => {
           try {
-            await this.downloadDiagramAs(renderSource, 'svg', `${diagramType}-diagram`, diagramType);
+            await this.downloadDiagramAs(renderSource, 'svg', `${diagramType}-diagram`, diagramType, context, container.ownerDocument);
+            checkRenderSignal(context.signal);
             new Notice('Diagram saved as SVG');
           } catch (error) {
+            if (context.signal.aborted || isRenderCancelled(error)) return;
             new Notice(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
           }
         }),
@@ -701,56 +823,44 @@ export default class PUMLViewerPlugin extends Plugin {
     const loadingEl = diagramPane.createDiv({ cls: 'puml-loading', text: 'Generating diagram...' });
     try {
       if (this.settings.imageFormat === 'svg') {
-        const response = await this.requestDiagram(renderSource, 'svg', diagramType);
-
-        if (response.status !== 200) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const contentType = this.responseContentType(response);
-        if (contentType && !contentType.includes('image/svg')) {
-          throw new Error(
-            `Expected SVG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`,
-          );
-        }
-        if (!response.text.includes('<svg')) {
-          throw new Error('Response is not SVG content.');
-        }
+        const svgEl = await this.fetchSvgElement(renderSource, diagramType, context);
+        checkRenderSignal(context.signal);
 
         loadingEl.remove();
         const svgHost = diagramPane.createDiv();
-        const svgEl = parseSvgMarkup(response.text);
-        if (svgEl) {
-          svgEl.addClass('puml-embed-svg');
-          svgHost.appendChild(svgEl);
-        } else {
-          throw new Error('Response is not valid SVG content.');
-        }
+        svgEl.addClass('puml-embed-svg');
+        svgHost.appendChild(svgEl);
       } else {
         const img = diagramPane.createEl('img', { cls: 'puml-embed-image puml-is-hidden' });
-        const objectUrl = await this.fetchPngObjectUrl(renderSource, diagramType);
-        img.src = objectUrl;
+        const objectUrl = await this.fetchPngObjectUrl(renderSource, diagramType, context);
         img.alt = `${diagramLabel} diagram`;
         img.addEventListener(
           'load',
           () => {
+            if (context.signal.aborted) return;
             loadingEl.remove();
             img.removeClass('puml-is-hidden');
-            URL.revokeObjectURL(objectUrl);
           },
           { once: true },
         );
         img.addEventListener(
           'error',
           () => {
+            if (context.signal.aborted) return;
             loadingEl.remove();
-            URL.revokeObjectURL(objectUrl);
             diagramPane.createDiv({ cls: 'puml-embed-error', text: 'Failed to load PNG diagram.' });
           },
           { once: true },
         );
+        setDiagramImageUrl(img, objectUrl, context.signal);
       }
     } catch (error) {
+      if (context.signal.aborted) return;
       diagramPane.empty();
+      if (isRenderCancelled(error)) {
+        diagramPane.createDiv({ text: 'Diagram generation cancelled.' });
+        return;
+      }
       diagramPane.createDiv({
         cls: 'puml-embed-error',
         text: `Failed to render diagram: ${
@@ -869,6 +979,9 @@ class PUMLViewerView extends ItemView {
   private mainPanStartY = 0;
   private mainPanScrollLeft = 0;
   private mainPanScrollTop = 0;
+  private renderController?: AbortController;
+  private cancelPendingJarRender?: () => void;
+  private readonly exportControllers = new Map<DiagramFormat, AbortController>();
 
   constructor(leaf: WorkspaceLeaf, plugin: PUMLViewerPlugin) {
     super(leaf);
@@ -965,15 +1078,16 @@ class PUMLViewerView extends ItemView {
     this.bindMainViewPanning();
 
     this.updateToolbarState();
-    await this.loadFileFromState();
-
     this.registerEvent(
       this.app.vault.on('modify', async (file) => {
         if (!this.currentFile || file.path !== this.currentFile.path) return;
+        this.cancelExports();
 
         if (this.mode === 'view') {
           if (this.plugin.settings.autoRefresh) {
             await this.renderDiagram();
+          } else {
+            this.cancelPendingJarRender?.();
           }
           return;
         }
@@ -986,6 +1100,18 @@ class PUMLViewerView extends ItemView {
         }
       }),
     );
+    await this.loadFileFromState();
+  }
+
+  async onClose(): Promise<void> {
+    this.renderController?.abort();
+    this.cancelExports();
+    await super.onClose();
+  }
+
+  private cancelExports(): void {
+    for (const controller of this.exportControllers.values()) controller.abort();
+    this.exportControllers.clear();
   }
 
   async setState(state: unknown, result: ViewStateResult): Promise<void> {
@@ -995,6 +1121,10 @@ class PUMLViewerView extends ItemView {
 
     if (viewState.mode) {
       this.mode = viewState.mode;
+      if (this.mode === 'edit') {
+        this.renderController?.abort();
+        this.cancelExports();
+      }
       this.updateToolbarState();
     }
 
@@ -1002,6 +1132,10 @@ class PUMLViewerView extends ItemView {
 
     const file = this.app.vault.getAbstractFileByPath(viewState.file);
     if (file instanceof TFile) {
+      if (file !== this.currentFile) {
+        this.renderController?.abort();
+        this.cancelExports();
+      }
       this.currentFile = file;
       void this.plugin.rememberLastPuml(file.path);
       this.resetDraftIfFileChanged();
@@ -1067,6 +1201,8 @@ class PUMLViewerView extends ItemView {
     if (!this.contentHostEl) return;
 
     if (this.mode === 'edit') {
+      this.renderController?.abort();
+      this.cancelExports();
       await this.renderEditor();
       return;
     }
@@ -1205,7 +1341,8 @@ class PUMLViewerView extends ItemView {
   }
 
   private async exportDiagram(format: DiagramFormat): Promise<void> {
-    if (this.mode !== 'view' || !this.currentFile) return;
+    const file = this.currentFile;
+    if (this.mode !== 'view' || !file) return;
     const diagramType = this.getCurrentDiagramType();
     if (!diagramType) return;
     if (diagramType === 'mermaid' && format === 'txt') {
@@ -1213,23 +1350,31 @@ class PUMLViewerView extends ItemView {
       return;
     }
 
+    this.exportControllers.get(format)?.abort();
+    const controller = new AbortController();
+    this.exportControllers.set(format, controller);
+    const { signal } = controller;
+    const sourcePath = file.path;
     try {
-      const source = await this.app.vault.read(this.currentFile);
+      const source = await this.app.vault.read(file);
+      checkRenderSignal(signal);
       if (!source.trim()) {
         new Notice('Diagram file is empty.');
         return;
       }
 
       const defaultOutputPath = normalizePath(
-        this.currentFile.path.replace(/\.[^/.]+$/i, `.${format}`),
+        sourcePath.replace(/\.[^/.]+$/i, `.${format}`),
       );
-      const outputPath = await this.resolveExportOutputPath(defaultOutputPath);
+      const outputPath = await this.resolveExportOutputPath(defaultOutputPath, signal);
+      checkRenderSignal(signal);
       if (!outputPath) {
         this.statusEl.setText('Export cancelled.');
         return;
       }
 
-      const response = await this.plugin.requestDiagram(source, format, diagramType);
+      const response = await this.plugin.requestDiagram(source, format, diagramType, { sourcePath, signal });
+      checkRenderSignal(signal);
 
       if (response.status !== 200) {
         throw new Error(`HTTP ${response.status}`);
@@ -1275,16 +1420,20 @@ class PUMLViewerView extends ItemView {
         }
       }
 
+      checkRenderSignal(signal);
       this.statusEl.setText(`Exported: ${outputPath}`);
       new Notice(`Diagram exported: ${outputPath}`);
     } catch (error) {
-      console.error(error);
+      if (signal.aborted || isRenderCancelled(error)) return;
+      if (!(error instanceof PlantUmlJarError)) console.error(error);
       this.statusEl.setText('Export failed.');
       new Notice(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (this.exportControllers.get(format) === controller) this.exportControllers.delete(format);
     }
   }
 
-  private async resolveExportOutputPath(defaultPath: string): Promise<string | null> {
+  private async resolveExportOutputPath(defaultPath: string, signal: AbortSignal): Promise<string | null> {
     const existing = this.app.vault.getAbstractFileByPath(defaultPath);
     if (!existing) return defaultPath;
 
@@ -1292,7 +1441,7 @@ class PUMLViewerView extends ItemView {
       return this.getNextAvailableExportPath(defaultPath);
     }
 
-    const action = await this.askExportConflict(defaultPath);
+    const action = await this.askExportConflict(defaultPath, signal);
     if (action === 'cancel') return null;
     if (action === 'overwrite') return defaultPath;
     return this.getNextAvailableExportPath(defaultPath);
@@ -1319,14 +1468,24 @@ class PUMLViewerView extends ItemView {
     throw new Error(`Could not find available file name for "${path}".`);
   }
 
-  private askExportConflict(path: string): Promise<ExportConflictAction> {
+  private askExportConflict(path: string, signal: AbortSignal): Promise<ExportConflictAction> {
     return new Promise((resolve) => {
-      const modal = new ExportConflictModal(this.app, path, resolve);
+      const close = () => modal.close();
+      const modal = new ExportConflictModal(this.app, path, (action) => {
+        signal.removeEventListener('abort', close);
+        resolve(action);
+      });
+      signal.addEventListener('abort', close, { once: true });
       modal.open();
     });
   }
 
   private async renderDiagram(): Promise<void> {
+    if (this.mode !== 'view') return;
+    this.renderController?.abort();
+    const controller = new AbortController();
+    this.renderController = controller;
+    const { signal } = controller;
     this.contentHostEl.empty();
     this.contentHostEl.removeClass('puml-viewer-content-host--editor');
     this.contentHostEl.addClass('puml-viewer-content-host--view');
@@ -1334,7 +1493,8 @@ class PUMLViewerView extends ItemView {
     this.editorGutterEl = null;
     this.editorEl = null;
 
-    if (!this.currentFile) {
+    const file = this.currentFile;
+    if (!file) {
       this.statusEl.setText('No diagram file selected.');
       return;
     }
@@ -1344,79 +1504,86 @@ class PUMLViewerView extends ItemView {
       return;
     }
     const diagramLabel = diagramType === 'mermaid' ? 'Mermaid' : 'PlantUML';
+    const context = { sourcePath: file.path, signal };
+    const format = this.plugin.settings.imageFormat;
+    let renderMode: RenderMode | undefined;
+    let loadingEl: HTMLDivElement | undefined;
+    const finishLoading = () => {
+      loadingEl?.remove();
+      signal.removeEventListener('abort', finishLoading);
+      if (this.renderController === controller) this.cancelPendingJarRender = undefined;
+    };
+    signal.addEventListener('abort', finishLoading, { once: true });
+    this.cancelPendingJarRender = () => {
+      if ((renderMode ?? this.plugin.settings.serverType) !== 'jar') return;
+      controller.abort();
+      this.statusEl.setText('File changed. Use the refresh button to render again.');
+    };
 
     try {
-      const source = await this.app.vault.read(this.currentFile);
+      const source = await this.app.vault.read(file);
+      checkRenderSignal(signal);
 
       if (!source.trim()) {
+        finishLoading();
         this.statusEl.setText('File is empty.');
         return;
       }
 
-      this.statusEl.setText(`Rendering: ${this.currentFile.name}`);
+      this.statusEl.setText(`Rendering: ${file.name}`);
       const renderRoot = this.contentHostEl.createDiv({ cls: 'puml-viewer-render-root' });
-      const loadingEl = renderRoot.createDiv({ cls: 'puml-loading', text: 'Generating diagram...' });
+      loadingEl = renderRoot.createDiv({ cls: 'puml-loading', text: 'Generating diagram...' });
 
-      if (this.plugin.settings.imageFormat === 'svg') {
-        const response = await this.plugin.requestDiagram(source, 'svg', diagramType);
+      renderMode = this.plugin.settings.serverType;
+      if (format === 'svg') {
+        const svgEl = await this.plugin.fetchSvgElement(source, diagramType, context);
+        checkRenderSignal(signal);
 
-        if (response.status !== 200) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const contentType = this.plugin.responseContentType(response);
-        if (contentType && !contentType.includes('image/svg')) {
-          throw new Error(
-            `Expected SVG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`,
-          );
-        }
-        if (!response.text.includes('<svg')) {
-          throw new Error('Response is not SVG content.');
-        }
-
-        loadingEl.remove();
+        finishLoading();
         const svgHost = renderRoot.createDiv();
-        const svgEl = parseSvgMarkup(response.text);
-        if (!svgEl) {
-          throw new Error('Response is not valid SVG content.');
-        }
         svgHost.appendChild(svgEl);
+        this.fitToWidth();
+        this.refreshMainPanAvailability();
+        this.statusEl.setText(`Rendered: ${file.name}`);
       } else {
         const img = renderRoot.createEl('img', {
           cls: 'puml-viewer-image puml-is-hidden',
         });
-        const objectUrl = await this.plugin.fetchPngObjectUrl(source, diagramType);
-        img.src = objectUrl;
+        const objectUrl = await this.plugin.fetchPngObjectUrl(source, diagramType, context);
         img.alt = `${diagramLabel} diagram`;
         img.addEventListener(
           'load',
           () => {
-            loadingEl.remove();
+            if (signal.aborted) return;
+            finishLoading();
             img.removeClass('puml-is-hidden');
-            this.statusEl.setText(`Rendered: ${this.currentFile?.name ?? ''}`);
-            URL.revokeObjectURL(objectUrl);
+            this.fitToWidth();
+            this.refreshMainPanAvailability();
+            this.statusEl.setText(`Rendered: ${file.name}`);
           },
           { once: true },
         );
         img.addEventListener(
           'error',
           () => {
-            loadingEl.remove();
+            if (signal.aborted) return;
+            finishLoading();
             this.statusEl.setText('Render failed.');
             const errorEl = renderRoot.createDiv({ cls: 'puml-viewer-error' });
             errorEl.setText('Failed to load PNG diagram.');
-            URL.revokeObjectURL(objectUrl);
           },
           { once: true },
         );
-      }
-
-      this.fitToWidth();
-      this.refreshMainPanAvailability();
-      if (this.plugin.settings.imageFormat === 'svg') {
-        this.statusEl.setText(`Rendered: ${this.currentFile.name}`);
+        setDiagramImageUrl(img, objectUrl, signal);
       }
     } catch (error) {
-      console.error(error);
+      if (signal.aborted) return;
+      finishLoading();
+      if (isRenderCancelled(error)) {
+        this.statusEl.setText('Diagram generation cancelled.');
+        return;
+      }
+      if (!(error instanceof PlantUmlJarError)) console.error(error);
       this.statusEl.setText('Render failed.');
 
       const errorEl = this.contentHostEl.createDiv({ cls: 'puml-viewer-error' });
@@ -1443,16 +1610,7 @@ class PUMLViewerView extends ItemView {
     const imageEl = renderRoot.querySelector<HTMLImageElement>('.puml-viewer-image');
     if (imageEl) {
       const baseWidth = this.getImageBaseWidth(imageEl);
-      if (!(baseWidth > 0)) {
-        imageEl.addEventListener(
-          'load',
-          () => {
-            this.fitToWidth();
-          },
-          { once: true },
-        );
-        return;
-      }
+      if (!(baseWidth > 0)) return;
 
       const availableWidth = Math.max(1, this.imageWrapEl.clientWidth - 24);
       this.setZoom(Math.min(1, availableWidth / baseWidth));
@@ -1659,24 +1817,37 @@ class PUMLViewerSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    const desktop = Platform.isDesktopApp;
+    const jarSelected = this.plugin.settings.serverType === 'jar';
+    const renderOptions: Record<string, string> = { plantuml: 'Plantuml', kroki: 'Kroki', local: 'Local' };
+    if (desktop || jarSelected) renderOptions.jar = desktop ? 'JAR' : 'JAR (desktop only)';
+    let renderDescription = 'Choose how to generate PlantUML diagrams.';
+    if (jarSelected) {
+      renderDescription = desktop
+        ? 'Run plantuml.jar using Java.'
+        : 'PlantUML JAR is available in desktop Obsidian. Choose an HTTP render mode on mobile.';
+    }
 
     new Setting(containerEl).setName('Plantuml viewer').setHeading();
 
     new Setting(containerEl)
-      .setName('Server type')
-      .setDesc('Choose which server URL to use for rendering.')
-      .addDropdown((dropdown) =>
+      .setName('Render mode')
+      .setDesc(renderDescription)
+      .addDropdown((dropdown) => {
+        const { selectEl } = dropdown.addOptions(renderOptions);
+        selectEl.addClass('puml-render-mode-dropdown');
+        if (!desktop && jarSelected) {
+          selectEl.options[selectEl.options.length - 1].disabled = true;
+        }
         dropdown
-          .addOption('plantuml', 'Plantuml')
-          .addOption('kroki', 'Kroki')
-          .addOption('local', 'Local')
           .setValue(this.plugin.settings.serverType)
-          .onChange(async (value) => {
-            if (value !== 'plantuml' && value !== 'kroki' && value !== 'local') return;
-            this.plugin.settings.serverType = value;
-            await this.plugin.saveSettings();
-          }),
-      );
+          .onChange((value) => {
+            if (value !== 'plantuml' && value !== 'kroki' && value !== 'local' && value !== 'jar') return;
+            if (value === 'jar' && !desktop) return;
+            void this.plugin.setRenderMode(value).catch(() => new Notice('Could not save the render mode.'));
+            if (jarSelected !== (value === 'jar')) this.display();
+          });
+      });
 
     new Setting(containerEl)
       .setName('Plantuml server URL')
@@ -1731,6 +1902,10 @@ class PUMLViewerSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    if (desktop && jarSelected) {
+      addJarSettings(containerEl, this.plugin.settings, () => this.plugin.saveSettings());
+    }
 
     new Setting(containerEl)
       .setName('Image format')

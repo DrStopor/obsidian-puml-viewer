@@ -4693,8 +4693,417 @@ __export(main_exports, {
   default: () => PUMLViewerPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian = require("obsidian");
+var import_obsidian2 = require("obsidian");
 var import_plantuml_encoder = __toESM(require_browser_index());
+
+// src/plantuml-jar.ts
+var DEFAULT_PLANTUML_LIMIT_SIZE = 4096;
+var MAX_PLANTUML_LIMIT_SIZE = 2147483647;
+var TIMEOUT_MS = 6e4;
+var MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+var MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+var FORMATS = {
+  svg: { flag: "-tsvg", contentType: "image/svg+xml" },
+  png: { flag: "-tpng", contentType: "image/png" },
+  txt: { flag: "-ttxt", contentType: "text/plain" }
+};
+var PlantUmlJarError = class extends Error {
+};
+function isPlantUmlLimitSize(value) {
+  return Number.isInteger(value) && value >= 1 && value <= MAX_PLANTUML_LIMIT_SIZE;
+}
+function checkRenderSignal(signal) {
+  if (signal?.aborted) throw new DOMException("Diagram generation cancelled.", "AbortError");
+}
+var PlantUmlJarRenderer = class {
+  constructor() {
+    this.queue = [];
+    this.disposed = false;
+  }
+  async render(source, format, options, signal) {
+    checkRenderSignal(signal);
+    if (this.disposed) throw new DOMException("Diagram generation cancelled.", "AbortError");
+    return new Promise((resolve, reject) => {
+      const controller = new AbortController();
+      let settled = false;
+      let timeout;
+      const settle = (finish) => {
+        if (settled) return;
+        settled = true;
+        if (timeout !== void 0) globalThis.clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
+        finish();
+      };
+      const job = {
+        run: async () => {
+          try {
+            timeout = globalThis.setTimeout(() => {
+              job.cancel(new PlantUmlJarError("PlantUML did not finish within 60 seconds."));
+            }, TIMEOUT_MS);
+            const result = await renderWithJar(source, format, options, controller.signal);
+            settle(() => resolve(result));
+          } catch (error) {
+            settle(() => reject(error instanceof Error ? error : new PlantUmlJarError(String(error))));
+          }
+        },
+        cancel: (error) => settle(() => {
+          const index = this.queue.indexOf(job);
+          if (index !== -1) this.queue.splice(index, 1);
+          controller.abort();
+          reject(error);
+        })
+      };
+      const onAbort = () => job.cancel(new DOMException("Diagram generation cancelled.", "AbortError"));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.queue.push(job);
+      this.startNext();
+    });
+  }
+  cancelAll() {
+    const error = new DOMException("Diagram generation cancelled.", "AbortError");
+    for (const job of this.queue.splice(0)) job.cancel(error);
+    this.active?.cancel(error);
+  }
+  dispose() {
+    this.disposed = true;
+    this.cancelAll();
+  }
+  startNext() {
+    if (this.active || this.disposed) return;
+    const job = this.queue.shift();
+    if (!job) return;
+    this.active = job;
+    void job.run().finally(() => {
+      this.active = void 0;
+      this.startNext();
+    });
+  }
+};
+async function renderWithJar(source, format, options, signal) {
+  if (!isPlantUmlLimitSize(options.limitSize)) {
+    throw new PlantUmlJarError(`PLANTUML_LIMIT_SIZE must be a whole number from 1 to ${MAX_PLANTUML_LIMIT_SIZE}.`);
+  }
+  const { spawn, execFile } = require("node:child_process");
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const process = require("node:process");
+  const { Buffer: Buffer2 } = require("node:buffer");
+  const { randomUUID } = require("node:crypto");
+  const isFullPath = (value) => {
+    const root = path.parse(value).root;
+    return path.isAbsolute(value) && (!options.isWindows || root.length > 1);
+  };
+  const cwd = path.resolve(options.vaultPath, path.dirname(options.sourcePath || "."));
+  const jarPath = typeof options.jarPath === "string" ? options.jarPath : "";
+  if (!isFullPath(jarPath)) {
+    throw new PlantUmlJarError("Set JAR path to the full path of the PlantUML JAR.");
+  }
+  const jarErrorMessage = `Cannot read the PlantUML JAR at "${jarPath}".`;
+  const jarStat = await fs.promises.stat(jarPath).catch(() => null);
+  if (!jarStat?.isFile()) throw new PlantUmlJarError(jarErrorMessage);
+  try {
+    await fs.promises.access(jarPath, fs.constants.R_OK);
+  } catch {
+    throw new PlantUmlJarError(jarErrorMessage);
+  }
+  const cwdStat = await fs.promises.stat(cwd).catch(() => null);
+  if (!cwdStat?.isDirectory()) {
+    throw new PlantUmlJarError(`Cannot open the diagram folder "${cwd}".`);
+  }
+  const java = typeof options.javaExecutable === "string" ? options.javaExecutable || "java" : "java";
+  let executable = java;
+  if (options.isWindows && /\.(bat|cmd)$/i.test(java)) {
+    throw new PlantUmlJarError("Set Java executable to a Java .exe file.");
+  }
+  if (!isFullPath(java)) {
+    if (path.basename(java) !== java || path.parse(java).root) {
+      throw new PlantUmlJarError("Enter a Java executable name from PATH or a full path.");
+    }
+    const names = options.isWindows && !path.extname(java) ? [`${java}.exe`, `${java}.com`] : [java];
+    executable = "";
+    for (const entry of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+      const directory = options.isWindows ? entry.replace(/^"(.*)"$/, "$1") : entry;
+      for (const name of names) {
+        checkRenderSignal(signal);
+        const candidate = path.resolve(directory, name);
+        try {
+          if (!(await fs.promises.stat(candidate)).isFile()) continue;
+          await fs.promises.access(candidate, fs.constants.X_OK);
+          executable = candidate;
+          break;
+        } catch {
+        }
+      }
+      if (executable) break;
+    }
+    if (!executable) throw new PlantUmlJarError(`Java executable "${java}" was not found in PATH. Set Java executable to its full path.`);
+  }
+  checkRenderSignal(signal);
+  const marker = `PUML_VIEWER_END_${randomUUID()}`;
+  const args = [
+    "-Djava.awt.headless=true",
+    "-Dfile.encoding=UTF-8",
+    `-DPLANTUML_LIMIT_SIZE=${options.limitSize}`,
+    "-jar",
+    jarPath,
+    "-pipe",
+    "-charset",
+    "UTF-8",
+    "-stdrpt:1",
+    "-pipedelimitor",
+    marker,
+    FORMATS[format].flag
+  ];
+  const output = await new Promise((resolve, reject) => {
+    const startError = (error) => new PlantUmlJarError(`Could not start Java "${executable}": ${error.message}`);
+    let child;
+    try {
+      child = spawn(executable, args, { cwd, shell: false, windowsHide: true, detached: !options.isWindows, stdio: "pipe" });
+    } catch (error) {
+      reject(startError(error instanceof Error ? error : new Error(String(error))));
+      return;
+    }
+    const chunks = [];
+    let diagnostic = Buffer2.alloc(0);
+    let received = 0;
+    let stopping = false;
+    let outputError;
+    let launchError;
+    let inputError;
+    const stop = () => {
+      if (stopping) return;
+      stopping = true;
+      child.stdin.destroy();
+      const pid = child.pid;
+      if (!pid) return;
+      const killJava = () => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      };
+      if (!options.isWindows) {
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          killJava();
+        }
+        return;
+      }
+      const systemRoot = process.env.SystemRoot;
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      if (!systemRoot || !isFullPath(systemRoot)) {
+        killJava();
+        return;
+      }
+      execFile(path.join(systemRoot, "System32", "taskkill.exe"), ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 2e3,
+        maxBuffer: 64 * 1024
+      }, (error) => {
+        if (error) killJava();
+      });
+    };
+    const receive = (chunk) => {
+      if (stopping) return false;
+      received += chunk.length;
+      if (received <= MAX_OUTPUT_BYTES) return true;
+      outputError = new PlantUmlJarError("PlantUML output exceeded 64 MiB.");
+      stop();
+      return false;
+    };
+    child.stdout.on("data", (chunk) => {
+      if (receive(chunk)) chunks.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      if (!receive(chunk)) return;
+      diagnostic = Buffer2.concat([
+        diagnostic.subarray(Math.max(0, diagnostic.length + chunk.length - MAX_DIAGNOSTIC_BYTES)),
+        chunk.subarray(Math.max(0, chunk.length - MAX_DIAGNOSTIC_BYTES))
+      ]);
+    });
+    const onOutputError = (error) => {
+      outputError ?? (outputError = new PlantUmlJarError(`Could not read PlantUML output: ${error.message}`));
+      stop();
+    };
+    child.stdout.on("error", onOutputError);
+    child.stderr.on("error", onOutputError);
+    child.stdin.on("error", (error) => {
+      inputError = new PlantUmlJarError(`Could not send the diagram to Java: ${error.message}`);
+    });
+    child.on("error", (error) => {
+      launchError = startError(error);
+    });
+    signal.addEventListener("abort", stop, { once: true });
+    child.once("close", (code, killedBy) => {
+      signal.removeEventListener("abort", stop);
+      const stderr = diagnostic.toString("utf8").trim();
+      const reportedError = /^protocolVersion=1\r?\nstatus=ERROR\r?$/m.test(stderr);
+      const graphvizStartError = /^java\.io\.IOException: (Cannot run program [^\r\n]+)\r?\n(?:[ \t]+at [^\r\n]+\r?\n)*[ \t]+at net\.sourceforge\.plantuml\.dot\.GraphvizVersionFinder\.dotVersion\(/m.exec(stderr);
+      const graphvizOutputError = /^net\.sourceforge\.plantuml\.dot\.UnparsableGraphvizException: ([^\r\n]+)/m.exec(stderr);
+      const processError = outputError ?? launchError;
+      if (signal.aborted) reject(new DOMException("Diagram generation cancelled.", "AbortError"));
+      else if (processError) reject(processError);
+      else if (graphvizStartError) {
+        reject(new PlantUmlJarError(`Could not start Graphviz.
+${graphvizStartError[1].slice(0, 2048)}`));
+      } else if (graphvizOutputError) {
+        reject(new PlantUmlJarError(`Graphviz returned an invalid result.
+${graphvizOutputError[1].slice(0, 2048)}`));
+      } else if (code !== 0 || reportedError) {
+        const reason = code === null ? `was terminated (${killedBy ?? "unknown signal"})` : code === 0 ? "reported an error" : `failed (exit code ${code})`;
+        const detail = stderr || inputError?.message;
+        reject(new PlantUmlJarError(`PlantUML ${reason}.${detail ? `
+${detail.slice(-2048)}` : ""}`));
+      } else if (inputError) reject(inputError);
+      else resolve(Buffer2.concat(chunks));
+    });
+    child.stdin.end(source, "utf8");
+  });
+  const end = output.indexOf(marker);
+  if (end > -1 && output.indexOf(marker, end + marker.length) > -1) {
+    throw new PlantUmlJarError("PlantUML JAR rendering expects one diagram per block or file.");
+  }
+  if (output.length === 0 || end === 0) throw new PlantUmlJarError("PlantUML returned no diagram.");
+  const newline = end + marker.length;
+  const lineEnd = output.length - newline;
+  if (end === -1 || output[output.length - 1] !== 10 || lineEnd !== 1 && !(lineEnd === 2 && output[newline] === 13)) {
+    throw new PlantUmlJarError("PlantUML returned an incomplete diagram. Check the JAR version.");
+  }
+  const bytes = output.subarray(0, end);
+  let text = "";
+  if (format === "png") {
+    if (!bytes.subarray(0, 8).equals(Buffer2.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+      throw new PlantUmlJarError("PlantUML did not return a PNG image.");
+    }
+  } else {
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new PlantUmlJarError(`PlantUML did not return UTF-8 ${format.toUpperCase()} output.`);
+    }
+    const isSvg = /^\s*(?:<\?xml[^>]*>\s*)?<svg[\s>]/i.test(text);
+    if (format === "svg") {
+      if (text.includes(">For some reason, dot/GraphViz has crashed.</text>") && text.includes(">RootCause net.sourceforge.plantuml.")) {
+        throw new PlantUmlJarError("Graphviz crashed while rendering this diagram. Check your Graphviz installation.");
+      }
+      if (!isSvg) throw new PlantUmlJarError("PlantUML did not return an SVG image.");
+    } else {
+      const graphvizError = /^java\.lang\.IllegalStateException(?:: ([^\r\n]*))?\r?\n[ \t]+at net\.sourceforge\.plantuml\.(?:dot\.AbstractGraphviz|posimo\.GraphvizSolverB)\./.exec(text);
+      if (graphvizError) {
+        const detail = graphvizError[1]?.slice(0, 2048);
+        throw new PlantUmlJarError(`Graphviz could not render this diagram. Check your Graphviz installation.${detail ? `
+${detail}` : ""}`);
+      }
+      if (!text.trim() || isSvg || text.includes("\0")) {
+        throw new PlantUmlJarError("PlantUML did not return ASCII art for this diagram.");
+      }
+    }
+  }
+  return {
+    contentType: FORMATS[format].contentType,
+    text,
+    arrayBuffer: format === "png" ? Uint8Array.from(bytes).buffer : void 0
+  };
+}
+
+// src/jar-settings.ts
+var import_obsidian = require("obsidian");
+function getSelectedFilePath(file) {
+  const legacyPath = file.path;
+  if (legacyPath) return legacyPath;
+  const electron = require("electron");
+  return electron.webUtils?.getPathForFile(file) ?? "";
+}
+function addJarSettings(containerEl, settings, saveSettings) {
+  const heading = "PlantUML JAR";
+  const group = containerEl.createDiv({
+    cls: "puml-jar-settings",
+    attr: { role: "group", "aria-label": heading }
+  });
+  new import_obsidian.Setting(group).setName(heading).setHeading();
+  const save = () => {
+    void saveSettings().catch(() => new import_obsidian.Notice("Could not save the rendering options."));
+  };
+  addJarPathSetting(
+    group,
+    settings,
+    save,
+    "javaExecutable",
+    "Java executable",
+    "Enter an executable name from your system path or its full path."
+  );
+  addJarPathSetting(
+    group,
+    settings,
+    save,
+    "plantumlJarPath",
+    "JAR path",
+    "Enter the full path to plantuml.jar."
+  );
+  const sizeDescription = `Maximum width or height in pixels. Clear the field to use the default of ${DEFAULT_PLANTUML_LIMIT_SIZE}.`;
+  const sizeSetting = new import_obsidian.Setting(group).setName("Image size limit").setDesc(sizeDescription);
+  const showInvalidSize = () => {
+    const current = isPlantUmlLimitSize(settings.plantumlLimitSize) ? `Current value: ${settings.plantumlLimitSize}.` : "The saved value is invalid.";
+    sizeSetting.setDesc(`Enter a whole number from 1 to ${MAX_PLANTUML_LIMIT_SIZE}. ${current}`);
+  };
+  sizeSetting.addText((text) => {
+    const { inputEl } = text;
+    inputEl.type = "number";
+    inputEl.min = "1";
+    inputEl.max = String(MAX_PLANTUML_LIMIT_SIZE);
+    inputEl.step = "1";
+    text.setPlaceholder(String(DEFAULT_PLANTUML_LIMIT_SIZE));
+    text.setValue(String(settings.plantumlLimitSize));
+    if (!isPlantUmlLimitSize(settings.plantumlLimitSize)) showInvalidSize();
+    text.onChange((value) => {
+      const limit = value === "" ? DEFAULT_PLANTUML_LIMIT_SIZE : Number(value);
+      if (inputEl.validity.badInput || value !== "" && !/^\d+$/.test(value) || !isPlantUmlLimitSize(limit)) {
+        showInvalidSize();
+        return;
+      }
+      sizeSetting.setDesc(sizeDescription);
+      if (settings.plantumlLimitSize === limit) return;
+      settings.plantumlLimitSize = limit;
+      save();
+    });
+  });
+}
+function addJarPathSetting(group, settings, saveSettings, key, name, description) {
+  const isJar = key === "plantumlJarPath";
+  const defaultValue = isJar ? "" : "java";
+  const setting = new import_obsidian.Setting(group).setName(name).setDesc(description);
+  const picker = setting.controlEl.createEl("input", { type: "file" });
+  picker.hidden = true;
+  if (isJar) picker.accept = ".jar";
+  const save = (value) => {
+    settings[key] = value || defaultValue;
+    saveSettings();
+  };
+  setting.addText((text) => {
+    if (isJar) text.setPlaceholder("Full path to plantuml.jar");
+    text.setValue(typeof settings[key] === "string" ? settings[key] : defaultValue).onChange(save);
+    picker.addEventListener("change", () => {
+      const file = picker.files?.[0];
+      picker.value = "";
+      if (!file || !setting.settingEl.isConnected) return;
+      let path;
+      try {
+        path = getSelectedFilePath(file);
+      } catch {
+        path = "";
+      }
+      if (!path) {
+        new import_obsidian.Notice("Could not get the selected file path. Enter it in the text field.");
+        return;
+      }
+      text.setValue(path);
+      save(path);
+    });
+  });
+  setting.addButton(
+    (button) => button.setButtonText("Browse\u2026").setTooltip(isJar ? "Choose a PlantUML JAR file" : "Choose a Java executable").onClick(() => picker.click())
+  );
+}
+
+// src/main.ts
 var VIEW_TYPE_PUML = "puml-viewer";
 var encodePlantuml = import_plantuml_encoder.encode;
 var CSS_AUTO = "auto";
@@ -4711,6 +5120,9 @@ var DEFAULT_SETTINGS = {
   krokiServerUrl: "https://kroki.io",
   krokiDiagramType: "plantuml",
   localServerUrl: "http://localhost:8000",
+  javaExecutable: "java",
+  plantumlJarPath: "",
+  plantumlLimitSize: DEFAULT_PLANTUML_LIMIT_SIZE,
   imageFormat: "svg",
   autoRefresh: true,
   lastOpenedPumlPath: "",
@@ -4771,7 +5183,30 @@ function parseSvgMarkup(svgMarkup) {
   normalizeSvgForResponsiveLayout(normalized);
   return normalized;
 }
-var PUMLViewerPlugin = class extends import_obsidian.Plugin {
+function isRenderCancelled(error) {
+  return error instanceof Error && error.name === "AbortError";
+}
+function setDiagramImageUrl(img, objectUrl, signal) {
+  const release = () => {
+    URL.revokeObjectURL(objectUrl);
+    signal.removeEventListener("abort", release);
+    img.removeEventListener("load", release);
+    img.removeEventListener("error", release);
+  };
+  if (signal.aborted) {
+    release();
+    checkRenderSignal(signal);
+  }
+  signal.addEventListener("abort", release, { once: true });
+  img.addEventListener("load", release, { once: true });
+  img.addEventListener("error", release, { once: true });
+  img.src = objectUrl;
+}
+var PUMLViewerPlugin = class extends import_obsidian2.Plugin {
+  constructor() {
+    super(...arguments);
+    this.renderLifetime = new AbortController();
+  }
   async onload() {
     await this.loadSettings();
     this.registerView(VIEW_TYPE_PUML, (leaf) => new PUMLViewerView(leaf, this));
@@ -4802,12 +5237,14 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
           source,
           lang
         );
-        await this.renderEmbeddedDiagramBlock(source, el, fenceWidthHintPx, lang);
+        await this.renderEmbeddedDiagramBlock(source, el, fenceWidthHintPx, lang, ctx);
       });
     }
     this.addSettingTab(new PUMLViewerSettingTab(this.app, this));
   }
   onunload() {
+    this.renderLifetime.abort();
+    this.jarRenderer?.dispose();
     this.app.workspace.getLeavesOfType(VIEW_TYPE_PUML).forEach((leaf) => leaf.detach());
   }
   async loadSettings() {
@@ -4817,7 +5254,7 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
         loaded.krokiServerUrl = loaded.serverUrl;
       } else if (loaded.serverType === "local") {
         loaded.localServerUrl = loaded.serverUrl;
-      } else {
+      } else if (loaded.serverType !== "jar") {
         loaded.plantumlServerUrl = loaded.serverUrl;
       }
     }
@@ -4826,11 +5263,16 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
   }
+  async setRenderMode(mode) {
+    if (mode !== this.settings.serverType) this.jarRenderer?.cancelAll();
+    this.settings.serverType = mode;
+    await this.saveSettings();
+  }
   rerenderMarkdownPreviews() {
     const leaves = this.app.workspace.getLeavesOfType("markdown");
     for (const leaf of leaves) {
       const view = leaf.view;
-      if (view instanceof import_obsidian.MarkdownView) {
+      if (view instanceof import_obsidian2.MarkdownView) {
         view.previewMode.rerender(true);
       }
     }
@@ -4850,6 +5292,9 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
     this.app.workspace.setActiveLeaf(leaf, { focus: true });
   }
   buildRenderUrl(source, diagramType) {
+    if (this.settings.serverType === "jar") {
+      throw new PlantUmlJarError("PlantUML JAR rendering does not use a server URL.");
+    }
     const useKroki = this.settings.serverType === "kroki" || diagramType === "mermaid";
     const normalizedBase = useKroki ? this.settings.krokiServerUrl.replace(/\/+$/, "").replace(/\/plantuml$/i, "") : this.getActiveServerUrl().replace(/\/+$/, "");
     const encoded = encodePlantuml(source);
@@ -4880,13 +5325,42 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
     const headers = response.headers ?? {};
     return headers["content-type"] ?? headers["Content-Type"] ?? "";
   }
-  async requestDiagram(source, format, diagramType) {
+  async requestDiagram(source, format, diagramType, context) {
+    checkRenderSignal(this.renderLifetime.signal);
+    checkRenderSignal(context?.signal);
+    if (this.settings.serverType === "jar") {
+      if (!import_obsidian2.Platform.isDesktopApp) {
+        throw new PlantUmlJarError("PlantUML JAR is available in desktop Obsidian. Choose an HTTP render mode on mobile.");
+      }
+      if (diagramType === "mermaid") {
+        throw new PlantUmlJarError("PlantUML JAR renders PlantUML diagrams. Choose an HTTP render mode for Mermaid.");
+      }
+      const adapter = this.app.vault.adapter;
+      if (!(adapter instanceof import_obsidian2.FileSystemAdapter)) {
+        throw new PlantUmlJarError("PlantUML JAR requires a local vault folder.");
+      }
+      this.jarRenderer ?? (this.jarRenderer = new PlantUmlJarRenderer());
+      const result = await this.jarRenderer.render(source, format, {
+        javaExecutable: this.settings.javaExecutable,
+        jarPath: this.settings.plantumlJarPath,
+        limitSize: this.settings.plantumlLimitSize,
+        vaultPath: adapter.getBasePath(),
+        sourcePath: context?.sourcePath,
+        isWindows: import_obsidian2.Platform.isWin
+      }, context?.signal);
+      return {
+        status: 200,
+        headers: { "content-type": result.contentType },
+        text: result.text,
+        arrayBuffer: result.arrayBuffer
+      };
+    }
     const useKroki = this.settings.serverType === "kroki" || diagramType === "mermaid";
     if (useKroki) {
       const normalizedBase2 = this.settings.krokiServerUrl.replace(/\/+$/, "").replace(/\/plantuml$/i, "");
       const resolvedDiagramType = diagramType ?? this.settings.krokiDiagramType;
       const accept = format === "svg" ? "image/svg+xml" : format === "png" ? "image/png" : "text/plain";
-      return (0, import_obsidian.requestUrl)({
+      return (0, import_obsidian2.requestUrl)({
         url: `${normalizedBase2}/${resolvedDiagramType}/${format}`,
         method: "POST",
         body: source,
@@ -4899,21 +5373,41 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
     }
     const normalizedBase = this.normalizedServerBase();
     const encoded = encodePlantuml(source);
-    return (0, import_obsidian.requestUrl)({
+    return (0, import_obsidian2.requestUrl)({
       url: `${normalizedBase}/${format}/${encoded}`,
       method: "GET",
       throw: false
     });
   }
-  async fetchPngObjectUrl(source, diagramType) {
-    const response = await this.requestDiagram(source, "png", diagramType);
+  async fetchSvgElement(source, diagramType, context) {
+    const response = await this.requestDiagram(source, "svg", diagramType, context);
+    checkRenderSignal(context?.signal);
+    if (response.status !== 200) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const contentType = this.responseContentType(response);
+    if (contentType && !contentType.includes("image/svg")) {
+      throw new Error(
+        `Expected SVG but got "${contentType}". Check the render mode and server URL (for Kroki use https://kroki.io).`
+      );
+    }
+    if (!response.text.includes("<svg")) {
+      throw new Error("Response is not SVG content.");
+    }
+    const svg = parseSvgMarkup(response.text);
+    if (!svg) throw new Error("Response is not valid SVG content.");
+    return svg;
+  }
+  async fetchPngObjectUrl(source, diagramType, context) {
+    const response = await this.requestDiagram(source, "png", diagramType, context);
+    checkRenderSignal(context?.signal);
     if (response.status !== 200) {
       throw new Error(`HTTP ${response.status}`);
     }
     const contentType = this.responseContentType(response);
     if (contentType && !contentType.includes("image/png")) {
       throw new Error(
-        `Expected PNG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`
+        `Expected PNG but got "${contentType}". Check the render mode and server URL (for Kroki use https://kroki.io).`
       );
     }
     if (!response.arrayBuffer) {
@@ -4922,8 +5416,9 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
     const blob = new Blob([response.arrayBuffer], { type: "image/png" });
     return URL.createObjectURL(blob);
   }
-  async downloadDiagramAs(source, format, baseName = "diagram", diagramType) {
-    const response = await this.requestDiagram(source, format, diagramType);
+  async downloadDiagramAs(source, format, baseName = "diagram", diagramType, context, doc = window.activeDocument) {
+    const response = await this.requestDiagram(source, format, diagramType, context);
+    checkRenderSignal(context?.signal);
     if (response.status !== 200) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -4932,7 +5427,7 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
       const contentType = this.responseContentType(response);
       if (contentType && !contentType.includes("image/svg")) {
         throw new Error(
-          `Expected SVG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`
+          `Expected SVG but got "${contentType}". Check the render mode and server URL (for Kroki use https://kroki.io).`
         );
       }
       if (!response.text.includes("<svg")) {
@@ -4943,7 +5438,7 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
       const contentType = this.responseContentType(response);
       if (contentType && !contentType.includes("image/png")) {
         throw new Error(
-          `Expected PNG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`
+          `Expected PNG but got "${contentType}". Check the render mode and server URL (for Kroki use https://kroki.io).`
         );
       }
       if (!response.arrayBuffer) {
@@ -4952,20 +5447,31 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
       blob = new Blob([response.arrayBuffer], { type: "image/png" });
     }
     const objectUrl = URL.createObjectURL(blob);
-    const link = window.activeDocument.body.createEl("a");
+    const link = doc.body.createEl("a");
     link.href = objectUrl;
     link.download = `${baseName}.${format}`;
     link.click();
     link.remove();
     URL.revokeObjectURL(objectUrl);
   }
-  async downloadDiagram(source, baseName = "diagram", diagramType) {
-    await this.downloadDiagramAs(source, this.settings.imageFormat, baseName, diagramType);
+  async downloadDiagram(source, baseName = "diagram", diagramType, context) {
+    await this.downloadDiagramAs(source, this.settings.imageFormat, baseName, diagramType, context);
   }
-  async renderEmbeddedDiagramBlock(source, el, fenceWidthHintPx, diagramType) {
+  async renderEmbeddedDiagramBlock(source, el, fenceWidthHintPx, diagramType, ctx) {
+    if (this.renderLifetime.signal.aborted) return;
     const diagramLabel = diagramType === "mermaid" ? "Mermaid" : "PlantUML";
     const { renderSource, widthHintPx } = this.extractEmbeddedWidthHint(source, fenceWidthHintPx);
     const container = el.createDiv({ cls: "puml-embed-block" });
+    const child = new import_obsidian2.MarkdownRenderChild(container);
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    this.renderLifetime.signal.addEventListener("abort", abort, { once: true });
+    child.register(() => {
+      this.renderLifetime.signal.removeEventListener("abort", abort);
+      abort();
+    });
+    ctx.addChild(child);
+    const context = { sourcePath: ctx.sourcePath, signal: controller.signal };
     const actionsEl = container.createDiv({ cls: "puml-embed-actions" });
     const toggleBtn = actionsEl.createEl("button", { cls: "puml-embed-toggle" });
     const zoomBtn = actionsEl.createEl("button", { cls: "puml-embed-zoom-btn", text: "Zoom" });
@@ -5026,7 +5532,12 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
       return;
     }
     const openZoomOverlay = async () => {
-      const overlayEl = window.activeDocument.body.createDiv({ cls: "puml-zoom-overlay" });
+      if (context.signal.aborted) return;
+      const doc = container.ownerDocument;
+      const viewWindow = doc.defaultView ?? window;
+      const overlayEl = doc.body.createDiv({ cls: "puml-zoom-overlay" });
+      const zoomController = new AbortController();
+      const zoomContext = { ...context, signal: zoomController.signal };
       const panelEl = overlayEl.createDiv({ cls: "puml-zoom-panel" });
       const headerEl = panelEl.createDiv({ cls: "puml-zoom-header" });
       headerEl.createDiv();
@@ -5072,8 +5583,8 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
       const centerViewportOnce = () => {
         if (centeredInitially) return;
         centeredInitially = true;
-        window.activeWindow.requestAnimationFrame(() => {
-          centerViewport();
+        viewWindow.requestAnimationFrame(() => {
+          if (!zoomContext.signal.aborted) centerViewport();
         });
       };
       zoomOutBtn.addEventListener("click", () => {
@@ -5112,13 +5623,15 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
         event.preventDefault();
       });
       contentEl.addEventListener("mouseleave", onPanMouseUp);
-      window.addEventListener("mousemove", onPanMouseMove);
-      window.addEventListener("mouseup", onPanMouseUp);
+      viewWindow.addEventListener("mousemove", onPanMouseMove);
+      viewWindow.addEventListener("mouseup", onPanMouseUp);
       const closeOverlay = () => {
-        window.activeDocument.removeEventListener("keydown", onKeyDown);
-        window.removeEventListener("resize", fitToViewport);
-        window.removeEventListener("mousemove", onPanMouseMove);
-        window.removeEventListener("mouseup", onPanMouseUp);
+        zoomController.abort();
+        context.signal.removeEventListener("abort", closeOverlay);
+        doc.removeEventListener("keydown", onKeyDown);
+        viewWindow.removeEventListener("resize", fitToViewport);
+        viewWindow.removeEventListener("mousemove", onPanMouseMove);
+        viewWindow.removeEventListener("mouseup", onPanMouseUp);
         overlayEl.remove();
       };
       const onKeyDown = (event) => {
@@ -5132,80 +5645,70 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
         }
       });
       closeBtn.addEventListener("click", closeOverlay);
-      window.activeDocument.addEventListener("keydown", onKeyDown);
-      window.addEventListener("resize", fitToViewport);
+      doc.addEventListener("keydown", onKeyDown);
+      viewWindow.addEventListener("resize", fitToViewport);
+      context.signal.addEventListener("abort", closeOverlay, { once: true });
       try {
         if (this.settings.imageFormat === "svg") {
-          const response = await this.requestDiagram(renderSource, "svg", diagramType);
-          if (response.status !== 200) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-          const contentType = this.responseContentType(response);
-          if (contentType && !contentType.includes("image/svg")) {
-            throw new Error(
-              `Expected SVG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`
-            );
-          }
-          if (!response.text.includes("<svg")) {
-            throw new Error("Response is not SVG content.");
-          }
+          const svgEl = await this.fetchSvgElement(renderSource, diagramType, zoomContext);
+          checkRenderSignal(zoomContext.signal);
           loadingEl2.remove();
           const svgHost = canvasEl.createDiv();
-          const svgEl = parseSvgMarkup(response.text);
-          if (svgEl) {
-            svgEl.addClass("puml-zoom-svg");
-            let baseSvgWidth = 0;
-            try {
-              const bbox = svgEl.getBBox();
-              if (bbox.width > 0 && bbox.height > 0) {
-                svgEl.setAttribute("viewBox", `${bbox.x} ${bbox.y} ${bbox.width} ${bbox.height}`);
-                baseSvgWidth = bbox.width;
-              }
-            } catch (error) {
-              console.debug("Failed to crop SVG by bbox", error);
+          svgEl.addClass("puml-zoom-svg");
+          let baseSvgWidth = 0;
+          try {
+            const bbox = svgEl.getBBox();
+            if (bbox.width > 0 && bbox.height > 0) {
+              svgEl.setAttribute("viewBox", `${bbox.x} ${bbox.y} ${bbox.width} ${bbox.height}`);
+              baseSvgWidth = bbox.width;
             }
-            renderedEl = svgEl;
-            const viewBoxWidth = baseSvgWidth || (svgEl.viewBox?.baseVal?.width ?? 0);
-            const widthAttr = Number.parseFloat(svgEl.getAttribute("width") ?? "0");
-            const measuredWidth = svgEl.getBoundingClientRect().width;
-            baseWidth = viewBoxWidth || widthAttr || measuredWidth || 1e3;
-            fitToViewport();
-            centerViewportOnce();
-            svgHost.appendChild(svgEl);
-          } else {
-            throw new Error("Response is not valid SVG content.");
+          } catch (error) {
+            console.debug("Failed to crop SVG by bbox", error);
           }
+          renderedEl = svgEl;
+          const viewBoxWidth = baseSvgWidth || (svgEl.viewBox?.baseVal?.width ?? 0);
+          const widthAttr = Number.parseFloat(svgEl.getAttribute("width") ?? "0");
+          const measuredWidth = svgEl.getBoundingClientRect().width;
+          baseWidth = viewBoxWidth || widthAttr || measuredWidth || 1e3;
+          fitToViewport();
+          centerViewportOnce();
+          svgHost.appendChild(svgEl);
           canvasEl.appendChild(svgHost);
         } else {
           const img = canvasEl.createEl("img", { cls: "puml-zoom-image puml-is-hidden" });
           img.alt = `${diagramLabel} diagram`;
-          const objectUrl = await this.fetchPngObjectUrl(renderSource, diagramType);
-          img.src = objectUrl;
+          const objectUrl = await this.fetchPngObjectUrl(renderSource, diagramType, zoomContext);
           img.addEventListener(
             "load",
             () => {
+              if (zoomContext.signal.aborted) return;
               loadingEl2.remove();
               renderedEl = img;
               baseWidth = img.naturalWidth || img.getBoundingClientRect().width || 1e3;
               fitToViewport();
               img.removeClass("puml-is-hidden");
               centerViewportOnce();
-              URL.revokeObjectURL(objectUrl);
             },
             { once: true }
           );
           img.addEventListener(
             "error",
             () => {
+              if (zoomContext.signal.aborted) return;
               loadingEl2.remove();
-              URL.revokeObjectURL(objectUrl);
               canvasEl.createDiv({ cls: "puml-embed-error", text: "Failed to load PNG diagram." });
             },
             { once: true }
           );
+          setDiagramImageUrl(img, objectUrl, zoomContext.signal);
         }
       } catch (error) {
+        if (zoomContext.signal.aborted) return;
         loadingEl2.remove();
+        if (isRenderCancelled(error)) {
+          canvasEl.createDiv({ text: "Diagram generation cancelled." });
+          return;
+        }
         canvasEl.createDiv({
           cls: "puml-embed-error",
           text: `Failed to render diagram: ${error instanceof Error ? error.message : String(error)}`
@@ -5216,24 +5719,29 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
       void openZoomOverlay();
     });
     saveBtn.addEventListener("click", (event) => {
-      const menu = new import_obsidian.Menu();
+      if (context.signal.aborted) return;
+      const menu = new import_obsidian2.Menu();
       menu.addItem(
         (item) => item.setTitle("Save as PNG").onClick(async () => {
           try {
-            await this.downloadDiagramAs(renderSource, "png", `${diagramType}-diagram`, diagramType);
-            new import_obsidian.Notice("Diagram saved as PNG");
+            await this.downloadDiagramAs(renderSource, "png", `${diagramType}-diagram`, diagramType, context, container.ownerDocument);
+            checkRenderSignal(context.signal);
+            new import_obsidian2.Notice("Diagram saved as PNG");
           } catch (error) {
-            new import_obsidian.Notice(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
+            if (context.signal.aborted || isRenderCancelled(error)) return;
+            new import_obsidian2.Notice(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
           }
         })
       );
       menu.addItem(
         (item) => item.setTitle("Save as SVG").onClick(async () => {
           try {
-            await this.downloadDiagramAs(renderSource, "svg", `${diagramType}-diagram`, diagramType);
-            new import_obsidian.Notice("Diagram saved as SVG");
+            await this.downloadDiagramAs(renderSource, "svg", `${diagramType}-diagram`, diagramType, context, container.ownerDocument);
+            checkRenderSignal(context.signal);
+            new import_obsidian2.Notice("Diagram saved as SVG");
           } catch (error) {
-            new import_obsidian.Notice(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
+            if (context.signal.aborted || isRenderCancelled(error)) return;
+            new import_obsidian2.Notice(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
           }
         })
       );
@@ -5243,63 +5751,52 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
       void (async () => {
         try {
           await navigator.clipboard.writeText(renderSource);
-          new import_obsidian.Notice(`${diagramLabel} code copied.`);
+          new import_obsidian2.Notice(`${diagramLabel} code copied.`);
         } catch (error) {
-          new import_obsidian.Notice(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
+          new import_obsidian2.Notice(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
         }
       })();
     });
     const loadingEl = diagramPane.createDiv({ cls: "puml-loading", text: "Generating diagram..." });
     try {
       if (this.settings.imageFormat === "svg") {
-        const response = await this.requestDiagram(renderSource, "svg", diagramType);
-        if (response.status !== 200) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const contentType = this.responseContentType(response);
-        if (contentType && !contentType.includes("image/svg")) {
-          throw new Error(
-            `Expected SVG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`
-          );
-        }
-        if (!response.text.includes("<svg")) {
-          throw new Error("Response is not SVG content.");
-        }
+        const svgEl = await this.fetchSvgElement(renderSource, diagramType, context);
+        checkRenderSignal(context.signal);
         loadingEl.remove();
         const svgHost = diagramPane.createDiv();
-        const svgEl = parseSvgMarkup(response.text);
-        if (svgEl) {
-          svgEl.addClass("puml-embed-svg");
-          svgHost.appendChild(svgEl);
-        } else {
-          throw new Error("Response is not valid SVG content.");
-        }
+        svgEl.addClass("puml-embed-svg");
+        svgHost.appendChild(svgEl);
       } else {
         const img = diagramPane.createEl("img", { cls: "puml-embed-image puml-is-hidden" });
-        const objectUrl = await this.fetchPngObjectUrl(renderSource, diagramType);
-        img.src = objectUrl;
+        const objectUrl = await this.fetchPngObjectUrl(renderSource, diagramType, context);
         img.alt = `${diagramLabel} diagram`;
         img.addEventListener(
           "load",
           () => {
+            if (context.signal.aborted) return;
             loadingEl.remove();
             img.removeClass("puml-is-hidden");
-            URL.revokeObjectURL(objectUrl);
           },
           { once: true }
         );
         img.addEventListener(
           "error",
           () => {
+            if (context.signal.aborted) return;
             loadingEl.remove();
-            URL.revokeObjectURL(objectUrl);
             diagramPane.createDiv({ cls: "puml-embed-error", text: "Failed to load PNG diagram." });
           },
           { once: true }
         );
+        setDiagramImageUrl(img, objectUrl, context.signal);
       }
     } catch (error) {
+      if (context.signal.aborted) return;
       diagramPane.empty();
+      if (isRenderCancelled(error)) {
+        diagramPane.createDiv({ text: "Diagram generation cancelled." });
+        return;
+      }
       diagramPane.createDiv({
         cls: "puml-embed-error",
         text: `Failed to render diagram: ${error instanceof Error ? error.message : String(error)}`
@@ -5370,7 +5867,7 @@ var PUMLViewerPlugin = class extends import_obsidian.Plugin {
     }
   }
 };
-var PUMLViewerView = class extends import_obsidian.ItemView {
+var PUMLViewerView = class extends import_obsidian2.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.currentFile = null;
@@ -5386,6 +5883,7 @@ var PUMLViewerView = class extends import_obsidian.ItemView {
     this.mainPanStartY = 0;
     this.mainPanScrollLeft = 0;
     this.mainPanScrollTop = 0;
+    this.exportControllers = /* @__PURE__ */ new Map();
     this.plugin = plugin;
   }
   getViewType() {
@@ -5460,13 +5958,15 @@ var PUMLViewerView = class extends import_obsidian.ItemView {
     this.contentHostEl = this.imageWrapEl.createDiv({ cls: "puml-viewer-content-host" });
     this.bindMainViewPanning();
     this.updateToolbarState();
-    await this.loadFileFromState();
     this.registerEvent(
       this.app.vault.on("modify", async (file) => {
         if (!this.currentFile || file.path !== this.currentFile.path) return;
+        this.cancelExports();
         if (this.mode === "view") {
           if (this.plugin.settings.autoRefresh) {
             await this.renderDiagram();
+          } else {
+            this.cancelPendingJarRender?.();
           }
           return;
         }
@@ -5478,17 +5978,35 @@ var PUMLViewerView = class extends import_obsidian.ItemView {
         }
       })
     );
+    await this.loadFileFromState();
+  }
+  async onClose() {
+    this.renderController?.abort();
+    this.cancelExports();
+    await super.onClose();
+  }
+  cancelExports() {
+    for (const controller of this.exportControllers.values()) controller.abort();
+    this.exportControllers.clear();
   }
   async setState(state, result) {
     await super.setState(state, result);
     const viewState = state ?? {};
     if (viewState.mode) {
       this.mode = viewState.mode;
+      if (this.mode === "edit") {
+        this.renderController?.abort();
+        this.cancelExports();
+      }
       this.updateToolbarState();
     }
     if (!viewState.file) return;
     const file = this.app.vault.getAbstractFileByPath(viewState.file);
-    if (file instanceof import_obsidian.TFile) {
+    if (file instanceof import_obsidian2.TFile) {
+      if (file !== this.currentFile) {
+        this.renderController?.abort();
+        this.cancelExports();
+      }
       this.currentFile = file;
       void this.plugin.rememberLastPuml(file.path);
       this.resetDraftIfFileChanged();
@@ -5523,7 +6041,7 @@ var PUMLViewerView = class extends import_obsidian.ItemView {
       if (!path || tried.has(path)) continue;
       tried.add(path);
       const file = this.app.vault.getAbstractFileByPath(path);
-      if (file instanceof import_obsidian.TFile && getDiagramTypeByExtension(file.extension)) {
+      if (file instanceof import_obsidian2.TFile && getDiagramTypeByExtension(file.extension)) {
         this.currentFile = file;
         void this.plugin.rememberLastPuml(file.path);
         this.resetDraftIfFileChanged();
@@ -5543,6 +6061,8 @@ var PUMLViewerView = class extends import_obsidian.ItemView {
   async renderActiveMode() {
     if (!this.contentHostEl) return;
     if (this.mode === "edit") {
+      this.renderController?.abort();
+      this.cancelExports();
       await this.renderEditor();
       return;
     }
@@ -5646,41 +6166,50 @@ ${error instanceof Error ? error.message : String(error)}`
       this.draftFilePath = this.currentFile.path;
       this.isDirty = false;
       this.statusEl.setText(`Saved: ${this.currentFile.name}`);
-      new import_obsidian.Notice("Diagram source saved.");
+      new import_obsidian2.Notice("Diagram source saved.");
     } catch (error) {
       console.error(error);
       this.statusEl.setText("Save failed.");
-      new import_obsidian.Notice("Failed to save diagram source.");
+      new import_obsidian2.Notice("Failed to save diagram source.");
     }
   }
   async exportDiagram(format) {
-    if (this.mode !== "view" || !this.currentFile) return;
+    const file = this.currentFile;
+    if (this.mode !== "view" || !file) return;
     const diagramType = this.getCurrentDiagramType();
     if (!diagramType) return;
     if (diagramType === "mermaid" && format === "txt") {
-      new import_obsidian.Notice("ASCII export is only available for plantuml.");
+      new import_obsidian2.Notice("ASCII export is only available for plantuml.");
       return;
     }
+    this.exportControllers.get(format)?.abort();
+    const controller = new AbortController();
+    this.exportControllers.set(format, controller);
+    const { signal } = controller;
+    const sourcePath = file.path;
     try {
-      const source = await this.app.vault.read(this.currentFile);
+      const source = await this.app.vault.read(file);
+      checkRenderSignal(signal);
       if (!source.trim()) {
-        new import_obsidian.Notice("Diagram file is empty.");
+        new import_obsidian2.Notice("Diagram file is empty.");
         return;
       }
-      const defaultOutputPath = (0, import_obsidian.normalizePath)(
-        this.currentFile.path.replace(/\.[^/.]+$/i, `.${format}`)
+      const defaultOutputPath = (0, import_obsidian2.normalizePath)(
+        sourcePath.replace(/\.[^/.]+$/i, `.${format}`)
       );
-      const outputPath = await this.resolveExportOutputPath(defaultOutputPath);
+      const outputPath = await this.resolveExportOutputPath(defaultOutputPath, signal);
+      checkRenderSignal(signal);
       if (!outputPath) {
         this.statusEl.setText("Export cancelled.");
         return;
       }
-      const response = await this.plugin.requestDiagram(source, format, diagramType);
+      const response = await this.plugin.requestDiagram(source, format, diagramType, { sourcePath, signal });
+      checkRenderSignal(signal);
       if (response.status !== 200) {
         throw new Error(`HTTP ${response.status}`);
       }
       const existing = this.app.vault.getAbstractFileByPath(outputPath);
-      if (existing && !(existing instanceof import_obsidian.TFile)) {
+      if (existing && !(existing instanceof import_obsidian2.TFile)) {
         throw new Error(`Cannot export: "${outputPath}" is not a file.`);
       }
       if (format === "svg") {
@@ -5688,7 +6217,7 @@ ${error instanceof Error ? error.message : String(error)}`
         if (contentType && !contentType.includes("image/svg")) {
           throw new Error(`Expected SVG but got "${contentType}"`);
         }
-        if (existing instanceof import_obsidian.TFile) {
+        if (existing instanceof import_obsidian2.TFile) {
           await this.app.vault.modify(existing, response.text);
         } else {
           await this.app.vault.create(outputPath, response.text);
@@ -5701,7 +6230,7 @@ ${error instanceof Error ? error.message : String(error)}`
         if (!response.arrayBuffer) {
           throw new Error("No PNG payload returned by render server");
         }
-        if (existing instanceof import_obsidian.TFile) {
+        if (existing instanceof import_obsidian2.TFile) {
           await this.app.vault.modifyBinary(existing, response.arrayBuffer);
         } else {
           await this.app.vault.createBinary(outputPath, response.arrayBuffer);
@@ -5711,27 +6240,31 @@ ${error instanceof Error ? error.message : String(error)}`
         if (contentType && !contentType.includes("text/plain")) {
           throw new Error(`Expected text/plain but got "${contentType}"`);
         }
-        if (existing instanceof import_obsidian.TFile) {
+        if (existing instanceof import_obsidian2.TFile) {
           await this.app.vault.modify(existing, response.text);
         } else {
           await this.app.vault.create(outputPath, response.text);
         }
       }
+      checkRenderSignal(signal);
       this.statusEl.setText(`Exported: ${outputPath}`);
-      new import_obsidian.Notice(`Diagram exported: ${outputPath}`);
+      new import_obsidian2.Notice(`Diagram exported: ${outputPath}`);
     } catch (error) {
-      console.error(error);
+      if (signal.aborted || isRenderCancelled(error)) return;
+      if (!(error instanceof PlantUmlJarError)) console.error(error);
       this.statusEl.setText("Export failed.");
-      new import_obsidian.Notice(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
+      new import_obsidian2.Notice(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (this.exportControllers.get(format) === controller) this.exportControllers.delete(format);
     }
   }
-  async resolveExportOutputPath(defaultPath) {
+  async resolveExportOutputPath(defaultPath, signal) {
     const existing = this.app.vault.getAbstractFileByPath(defaultPath);
     if (!existing) return defaultPath;
-    if (!(existing instanceof import_obsidian.TFile)) {
+    if (!(existing instanceof import_obsidian2.TFile)) {
       return this.getNextAvailableExportPath(defaultPath);
     }
-    const action = await this.askExportConflict(defaultPath);
+    const action = await this.askExportConflict(defaultPath, signal);
     if (action === "cancel") return null;
     if (action === "overwrite") return defaultPath;
     return this.getNextAvailableExportPath(defaultPath);
@@ -5746,7 +6279,7 @@ ${error instanceof Error ? error.message : String(error)}`
     let index = 1;
     while (index < 1e4) {
       const candidateName = `${base}-${index}${ext}`;
-      const candidatePath = (0, import_obsidian.normalizePath)(dir ? `${dir}/${candidateName}` : candidateName);
+      const candidatePath = (0, import_obsidian2.normalizePath)(dir ? `${dir}/${candidateName}` : candidateName);
       if (!this.app.vault.getAbstractFileByPath(candidatePath)) {
         return candidatePath;
       }
@@ -5754,20 +6287,31 @@ ${error instanceof Error ? error.message : String(error)}`
     }
     throw new Error(`Could not find available file name for "${path}".`);
   }
-  askExportConflict(path) {
+  askExportConflict(path, signal) {
     return new Promise((resolve) => {
-      const modal = new ExportConflictModal(this.app, path, resolve);
+      const close = () => modal.close();
+      const modal = new ExportConflictModal(this.app, path, (action) => {
+        signal.removeEventListener("abort", close);
+        resolve(action);
+      });
+      signal.addEventListener("abort", close, { once: true });
       modal.open();
     });
   }
   async renderDiagram() {
+    if (this.mode !== "view") return;
+    this.renderController?.abort();
+    const controller = new AbortController();
+    this.renderController = controller;
+    const { signal } = controller;
     this.contentHostEl.empty();
     this.contentHostEl.removeClass("puml-viewer-content-host--editor");
     this.contentHostEl.addClass("puml-viewer-content-host--view");
     this.imageWrapEl.addClass("puml-viewer-image-wrap--view");
     this.editorGutterEl = null;
     this.editorEl = null;
-    if (!this.currentFile) {
+    const file = this.currentFile;
+    if (!file) {
       this.statusEl.setText("No diagram file selected.");
       return;
     }
@@ -5777,72 +6321,81 @@ ${error instanceof Error ? error.message : String(error)}`
       return;
     }
     const diagramLabel = diagramType === "mermaid" ? "Mermaid" : "PlantUML";
+    const context = { sourcePath: file.path, signal };
+    const format = this.plugin.settings.imageFormat;
+    let renderMode;
+    let loadingEl;
+    const finishLoading = () => {
+      loadingEl?.remove();
+      signal.removeEventListener("abort", finishLoading);
+      if (this.renderController === controller) this.cancelPendingJarRender = void 0;
+    };
+    signal.addEventListener("abort", finishLoading, { once: true });
+    this.cancelPendingJarRender = () => {
+      if ((renderMode ?? this.plugin.settings.serverType) !== "jar") return;
+      controller.abort();
+      this.statusEl.setText("File changed. Use the refresh button to render again.");
+    };
     try {
-      const source = await this.app.vault.read(this.currentFile);
+      const source = await this.app.vault.read(file);
+      checkRenderSignal(signal);
       if (!source.trim()) {
+        finishLoading();
         this.statusEl.setText("File is empty.");
         return;
       }
-      this.statusEl.setText(`Rendering: ${this.currentFile.name}`);
+      this.statusEl.setText(`Rendering: ${file.name}`);
       const renderRoot = this.contentHostEl.createDiv({ cls: "puml-viewer-render-root" });
-      const loadingEl = renderRoot.createDiv({ cls: "puml-loading", text: "Generating diagram..." });
-      if (this.plugin.settings.imageFormat === "svg") {
-        const response = await this.plugin.requestDiagram(source, "svg", diagramType);
-        if (response.status !== 200) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const contentType = this.plugin.responseContentType(response);
-        if (contentType && !contentType.includes("image/svg")) {
-          throw new Error(
-            `Expected SVG but got "${contentType}". Check Server type/URL (for Kroki use https://kroki.io).`
-          );
-        }
-        if (!response.text.includes("<svg")) {
-          throw new Error("Response is not SVG content.");
-        }
-        loadingEl.remove();
+      loadingEl = renderRoot.createDiv({ cls: "puml-loading", text: "Generating diagram..." });
+      renderMode = this.plugin.settings.serverType;
+      if (format === "svg") {
+        const svgEl = await this.plugin.fetchSvgElement(source, diagramType, context);
+        checkRenderSignal(signal);
+        finishLoading();
         const svgHost = renderRoot.createDiv();
-        const svgEl = parseSvgMarkup(response.text);
-        if (!svgEl) {
-          throw new Error("Response is not valid SVG content.");
-        }
         svgHost.appendChild(svgEl);
+        this.fitToWidth();
+        this.refreshMainPanAvailability();
+        this.statusEl.setText(`Rendered: ${file.name}`);
       } else {
         const img = renderRoot.createEl("img", {
           cls: "puml-viewer-image puml-is-hidden"
         });
-        const objectUrl = await this.plugin.fetchPngObjectUrl(source, diagramType);
-        img.src = objectUrl;
+        const objectUrl = await this.plugin.fetchPngObjectUrl(source, diagramType, context);
         img.alt = `${diagramLabel} diagram`;
         img.addEventListener(
           "load",
           () => {
-            loadingEl.remove();
+            if (signal.aborted) return;
+            finishLoading();
             img.removeClass("puml-is-hidden");
-            this.statusEl.setText(`Rendered: ${this.currentFile?.name ?? ""}`);
-            URL.revokeObjectURL(objectUrl);
+            this.fitToWidth();
+            this.refreshMainPanAvailability();
+            this.statusEl.setText(`Rendered: ${file.name}`);
           },
           { once: true }
         );
         img.addEventListener(
           "error",
           () => {
-            loadingEl.remove();
+            if (signal.aborted) return;
+            finishLoading();
             this.statusEl.setText("Render failed.");
             const errorEl = renderRoot.createDiv({ cls: "puml-viewer-error" });
             errorEl.setText("Failed to load PNG diagram.");
-            URL.revokeObjectURL(objectUrl);
           },
           { once: true }
         );
-      }
-      this.fitToWidth();
-      this.refreshMainPanAvailability();
-      if (this.plugin.settings.imageFormat === "svg") {
-        this.statusEl.setText(`Rendered: ${this.currentFile.name}`);
+        setDiagramImageUrl(img, objectUrl, signal);
       }
     } catch (error) {
-      console.error(error);
+      if (signal.aborted) return;
+      finishLoading();
+      if (isRenderCancelled(error)) {
+        this.statusEl.setText("Diagram generation cancelled.");
+        return;
+      }
+      if (!(error instanceof PlantUmlJarError)) console.error(error);
       this.statusEl.setText("Render failed.");
       const errorEl = this.contentHostEl.createDiv({ cls: "puml-viewer-error" });
       errorEl.setText(
@@ -5850,7 +6403,7 @@ ${error instanceof Error ? error.message : String(error)}`
 
 ${error instanceof Error ? error.message : String(error)}`
       );
-      new import_obsidian.Notice(`${diagramLabel} render failed.`);
+      new import_obsidian2.Notice(`${diagramLabel} render failed.`);
     }
   }
   setZoom(value) {
@@ -5866,16 +6419,7 @@ ${error instanceof Error ? error.message : String(error)}`
     const imageEl = renderRoot.querySelector(".puml-viewer-image");
     if (imageEl) {
       const baseWidth2 = this.getImageBaseWidth(imageEl);
-      if (!(baseWidth2 > 0)) {
-        imageEl.addEventListener(
-          "load",
-          () => {
-            this.fitToWidth();
-          },
-          { once: true }
-        );
-        return;
-      }
+      if (!(baseWidth2 > 0)) return;
       const availableWidth2 = Math.max(1, this.imageWrapEl.clientWidth - 24);
       this.setZoom(Math.min(1, availableWidth2 / baseWidth2));
       return;
@@ -5993,7 +6537,7 @@ ${error instanceof Error ? error.message : String(error)}`
     }
   }
 };
-var ExportConflictModal = class extends import_obsidian.Modal {
+var ExportConflictModal = class extends import_obsidian2.Modal {
   constructor(app, path, onResolve) {
     super(app);
     this.resolved = false;
@@ -6034,7 +6578,7 @@ var ExportConflictModal = class extends import_obsidian.Modal {
     this.close();
   }
 };
-var PUMLViewerSettingTab = class extends import_obsidian.PluginSettingTab {
+var PUMLViewerSettingTab = class extends import_obsidian2.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -6042,60 +6586,77 @@ var PUMLViewerSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("Plantuml viewer").setHeading();
-    new import_obsidian.Setting(containerEl).setName("Server type").setDesc("Choose which server URL to use for rendering.").addDropdown(
-      (dropdown) => dropdown.addOption("plantuml", "Plantuml").addOption("kroki", "Kroki").addOption("local", "Local").setValue(this.plugin.settings.serverType).onChange(async (value) => {
-        if (value !== "plantuml" && value !== "kroki" && value !== "local") return;
-        this.plugin.settings.serverType = value;
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("Plantuml server URL").setDesc("Example: https://www.plantuml.com/plantuml").addText(
+    const desktop = import_obsidian2.Platform.isDesktopApp;
+    const jarSelected = this.plugin.settings.serverType === "jar";
+    const renderOptions = { plantuml: "Plantuml", kroki: "Kroki", local: "Local" };
+    if (desktop || jarSelected) renderOptions.jar = desktop ? "JAR" : "JAR (desktop only)";
+    let renderDescription = "Choose how to generate PlantUML diagrams.";
+    if (jarSelected) {
+      renderDescription = desktop ? "Run plantuml.jar using Java." : "PlantUML JAR is available in desktop Obsidian. Choose an HTTP render mode on mobile.";
+    }
+    new import_obsidian2.Setting(containerEl).setName("Plantuml viewer").setHeading();
+    new import_obsidian2.Setting(containerEl).setName("Render mode").setDesc(renderDescription).addDropdown((dropdown) => {
+      const { selectEl } = dropdown.addOptions(renderOptions);
+      selectEl.addClass("puml-render-mode-dropdown");
+      if (!desktop && jarSelected) {
+        selectEl.options[selectEl.options.length - 1].disabled = true;
+      }
+      dropdown.setValue(this.plugin.settings.serverType).onChange((value) => {
+        if (value !== "plantuml" && value !== "kroki" && value !== "local" && value !== "jar") return;
+        if (value === "jar" && !desktop) return;
+        void this.plugin.setRenderMode(value).catch(() => new import_obsidian2.Notice("Could not save the render mode."));
+        if (jarSelected !== (value === "jar")) this.display();
+      });
+    });
+    new import_obsidian2.Setting(containerEl).setName("Plantuml server URL").setDesc("Example: https://www.plantuml.com/plantuml").addText(
       (text) => text.setPlaceholder("https://www.plantuml.com/plantuml").setValue(this.plugin.settings.plantumlServerUrl).onChange(async (value) => {
         this.plugin.settings.plantumlServerUrl = value.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Kroki URL").setDesc("Example: https://kroki.io").addText(
+    new import_obsidian2.Setting(containerEl).setName("Kroki URL").setDesc("Example: https://kroki.io").addText(
       (text) => text.setPlaceholder("https://kroki.io").setValue(this.plugin.settings.krokiServerUrl).onChange(async (value) => {
         this.plugin.settings.krokiServerUrl = value.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Kroki diagram type").setDesc("Default diagram type for kroki requests outside explicit code block language.").addDropdown(
+    new import_obsidian2.Setting(containerEl).setName("Kroki diagram type").setDesc("Default diagram type for kroki requests outside explicit code block language.").addDropdown(
       (dropdown) => dropdown.addOption("plantuml", "Plantuml").addOption("mermaid", "Mermaid").setValue(this.plugin.settings.krokiDiagramType).onChange(async (value) => {
         if (value !== "plantuml" && value !== "mermaid") return;
         this.plugin.settings.krokiDiagramType = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Local URL").setDesc("Use a local server URL.").addText(
+    new import_obsidian2.Setting(containerEl).setName("Local URL").setDesc("Use a local server URL.").addText(
       (text) => text.setPlaceholder("Local server URL").setValue(this.plugin.settings.localServerUrl).onChange(async (value) => {
         this.plugin.settings.localServerUrl = value.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Image format").setDesc("SVG is recommended.").addDropdown(
+    if (desktop && jarSelected) {
+      addJarSettings(containerEl, this.plugin.settings, () => this.plugin.saveSettings());
+    }
+    new import_obsidian2.Setting(containerEl).setName("Image format").setDesc("SVG is recommended.").addDropdown(
       (dropdown) => dropdown.addOption("svg", "SVG").addOption("png", "PNG").setValue(this.plugin.settings.imageFormat).onChange(async (value) => {
         if (value !== "svg" && value !== "png") return;
         this.plugin.settings.imageFormat = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Auto refresh").setDesc("Automatically re-render diagram when the source file changes.").addToggle(
+    new import_obsidian2.Setting(containerEl).setName("Auto refresh").setDesc("Automatically re-render diagram when the source file changes.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.autoRefresh).onChange(async (value) => {
         this.plugin.settings.autoRefresh = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Embedded block default view").setDesc("Choose what to show first in embedded diagram blocks.").addDropdown(
+    new import_obsidian2.Setting(containerEl).setName("Embedded block default view").setDesc("Choose what to show first in embedded diagram blocks.").addDropdown(
       (dropdown) => dropdown.addOption("diagram", "Diagram").addOption("code", "Code").setValue(this.plugin.settings.embeddedDefaultView).onChange(async (value) => {
         if (value !== "diagram" && value !== "code") return;
         this.plugin.settings.embeddedDefaultView = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Embedded diagram alignment").setDesc("Default alignment for diagrams in embedded diagram blocks.").addDropdown(
+    new import_obsidian2.Setting(containerEl).setName("Embedded diagram alignment").setDesc("Default alignment for diagrams in embedded diagram blocks.").addDropdown(
       (dropdown) => dropdown.addOption("left", "Left").addOption("center", "Center").addOption("right", "Right").setValue(this.plugin.settings.embeddedDiagramAlign).onChange(async (value) => {
         if (value !== "left" && value !== "center" && value !== "right") return;
         this.plugin.settings.embeddedDiagramAlign = value;

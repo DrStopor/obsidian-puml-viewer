@@ -22,3 +22,9 @@ jobs:
 
       - name: Run lint
         run: npm run lint
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Run JAR tests
+        run: node --test tests/plantuml-jar.test.cjs

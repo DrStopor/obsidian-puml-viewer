@@ -31,6 +31,7 @@ A plugin for Obsidian that renders PlantUML/Mermaid from diagram files and from 
   - PlantUML server
   - Kroki (`https://kroki.io`)
   - Local server (for example `http://localhost:8000`)
+  - PlantUML JAR (desktop)
 - Supports both `SVG` and `PNG`
 
 ## Build
@@ -123,7 +124,7 @@ Export actions are available directly from the rendered block when you need to r
 
 ## Settings
 
-- `Server type`: `PlantUML` / `Kroki` / `Local`
+- `Render mode`: `PlantUML` / `Kroki` / `Local` / `JAR`
 - Separate URLs:
   - `PlantUML URL` (example: `https://www.plantuml.com/plantuml`)
   - `Kroki URL` (example: `https://kroki.io`)
@@ -135,10 +136,38 @@ Export actions are available directly from the rendered block when you need to r
 - `Embedded diagram alignment`: `left` / `center` / `right` (default `center`)
   - Applied immediately in markdown preview without Obsidian restart
 
+### Render with a PlantUML JAR
+
+On Windows, Linux, and macOS, install a Java runtime compatible with your
+[PlantUML JAR](https://plantuml.com/download). Some diagram types also need
+[Graphviz](https://plantuml.com/graphviz-dot).
+
+1. Choose `JAR` in **Render mode**. The **PlantUML JAR** group appears below **Local URL**.
+   The `Local` option uses a local HTTP server.
+2. Keep **Java executable** set to `java` if Obsidian can find it. Otherwise,
+   select the executable with **Browse…** or enter its full path.
+3. Select `plantuml.jar` with **Browse…** or enter its full path in **JAR path**.
+4. **Image size limit** sets the maximum width or height in pixels. Clear it
+   to restore the default of `4096`.
+
+Use one diagram per block or file. SVG and PNG use the first page of diagrams
+with `newpage`. ASCII export can include all pages for supported diagram types.
+Older JAR versions can return a PNG with an error message after a Graphviz
+crash. If this happens, check your Graphviz installation or update your JAR.
+
+Relative `!include` paths start from the folder of the Markdown note or
+`.puml` file. A request without a source file starts from the vault root.
+
+Mermaid uses Kroki in HTTP modes. On Android and iOS, choose an HTTP mode.
+If JAR mode is synced from desktop, the plugin prompts you to choose an HTTP mode.
+
 ## Disclosures
 
-- **Network usage**: plugin sends diagram source to the configured render server
-  (`PlantUML`, `Kroki`, or `Local`) to generate SVG/PNG/TXT output.
+- **Network usage** — HTTP modes send diagram source to the configured
+  server. In JAR mode, the source goes to the Java process. Directives such
+  as `!includeurl` can make network requests under PlantUML's security profile.
 - **Accounts / payments**: not required.
 - **Telemetry / ads**: none.
-- **External file access**: none outside Obsidian vault APIs.
+- **External process and file access** — JAR mode runs the selected Java
+  executable with the specified JAR. PlantUML can read files allowed by its
+  security profile and your account permissions.
